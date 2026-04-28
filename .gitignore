@@ -1,0 +1,18 @@
+# Credenciales y entorno
+.env
+venv/
+.python-version
+
+# Datos y archivos pesados (No subir datasets a GitHub)
+data/raw/*.parquet
+data/processed/*.csv
+*.parquet
+*.csv
+
+# Python (archivos temporales)
+__pycache__/
+*.py[cod]
+
+# Documentación temporal o de Office
+~$*.docx
+*.pdf
