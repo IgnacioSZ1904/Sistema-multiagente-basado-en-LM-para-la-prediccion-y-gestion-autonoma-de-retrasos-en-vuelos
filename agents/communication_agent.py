@@ -74,6 +74,20 @@ def communication_agent(state: SGIDAState) -> dict:
     operador sin respuesta: si algo falla, se devuelve un mensaje de
     fallback genérico en lugar de propagar el error sin texto visible.
     """
+    if not Settings.ollama_available() and not any(
+        [
+            state.get("analytics_result"),
+            state.get("delay_prediction"),
+            state.get("disruption_proposal"),
+            state.get("error"),
+        ]
+    ):
+        final_text = "Sistema en modo degradado: Ollama no está disponible. Revisa la configuración del modelo local o copia .env.example a .env antes de lanzar consultas complejas."
+        return {
+            "final_response": final_text,
+            "messages": [AIMessage(content=final_text)],
+        }
+
     messages: list = [
         SystemMessage(content=COMMUNICATION_SYSTEM_PROMPT),
         HumanMessage(content=_build_context_block(state)),

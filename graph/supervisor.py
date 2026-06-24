@@ -66,25 +66,26 @@ def _build_state_summary(state: SGIDAState) -> str:
 
 def supervisor(state: SGIDAState) -> dict:
     """
-    Nodo LangGraph del supervisor. Decide, via LLM con salida
-    estructurada, el siguiente nodo al que saltar, valida esa decision
-    con safe_next_node() y actualiza next_agent e iteration.
+    Nodo LangGraph del supervisor. Prioriza routing determinista para
+    evitar bloqueos innecesarios y solo usa LLM si Ollama está disponible.
     """
-    try:
-        structured_llm = get_llm().with_structured_output(RoutingDecision)
-        decision_raw = structured_llm.invoke([
-            SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-            HumanMessage(content=_build_state_summary(state)),
-        ])
-        decision = RoutingDecision.model_validate(decision_raw)
-        llm_choice = decision.next_node
-        if Settings.DEBUG_MODE:
-            print(f"[supervisor] LLM propone: {llm_choice} - {decision.rationale}")
+    llm_choice = safe_next_node(state, "")
 
-    except Exception as exc:  # noqa: BLE001
-        if Settings.DEBUG_MODE:
-            print(f"[supervisor] Error en decision de routing: {exc}")
-        llm_choice = "communication_agent"
+    if state["iteration"] == 0:
+        try:
+            structured_llm = get_llm().with_structured_output(RoutingDecision)
+            decision_raw = structured_llm.invoke([
+                SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
+                HumanMessage(content=_build_state_summary(state)),
+            ])
+            decision = RoutingDecision.model_validate(decision_raw)
+            llm_choice = safe_next_node(state, decision.next_node)
+            if Settings.DEBUG_MODE:
+                print(f"[supervisor] LLM propone: {decision.next_node} - {decision.rationale}")
+        except Exception as exc:  # noqa: BLE001
+            if Settings.DEBUG_MODE:
+                print(f"[supervisor] Error en decision de routing: {exc}")
+            llm_choice = "communication_agent"
 
     next_node = safe_next_node(state, llm_choice)
 

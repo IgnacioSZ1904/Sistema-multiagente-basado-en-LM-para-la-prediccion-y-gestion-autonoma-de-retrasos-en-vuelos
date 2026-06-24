@@ -17,7 +17,9 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -36,16 +38,18 @@ class Settings:
     # --- LLM (Ollama local) ----------------------------------------------
     OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1")
+    OLLAMA_ENABLED: bool = os.getenv("OLLAMA_ENABLED", "true").lower() == "true"
 
     # --- Parámetros del LLM ----------------------------------------------
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+    LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
 
     # --- Base de datos ---------------------------------------------------
     DB_PATH: str = os.getenv("DB_PATH", "data/analytical_db.duckdb")
 
     # --- Parámetros del grafo -------------------------------------------
-    GRAPH_MAX_ITERATIONS: int = int(os.getenv("GRAPH_MAX_ITERATIONS", "10"))
+    GRAPH_MAX_ITERATIONS: int = int(os.getenv("GRAPH_MAX_ITERATIONS", "6"))
 
     # --- Dominio aéreo ---------------------------------------------------
     DELAY_THRESHOLD_MINUTES: int = int(os.getenv("DELAY_THRESHOLD_MINUTES", "15"))
@@ -55,7 +59,7 @@ class Settings:
 
     @classmethod
     def validate(cls) -> None:
-        """Valida que la configuración mínima esté presente y Ollama responda."""
+        """Valida que la configuración mínima esté presente."""
         if not cls.OLLAMA_MODEL:
             raise ValueError("Falta OLLAMA_MODEL en .env (ej. 'llama3.1').")
 
@@ -66,19 +70,29 @@ class Settings:
             print(f"  DB path    : {cls.DB_PATH}")
             print(f"  Threshold  : {cls.DELAY_THRESHOLD_MINUTES} min")
 
+    @classmethod
+    def ollama_available(cls) -> bool:
+        if not cls.OLLAMA_ENABLED:
+            return False
+
+        try:
+            response = httpx.get(
+                f"{cls.OLLAMA_BASE_URL}/api/tags",
+                timeout=min(cls.LLM_REQUEST_TIMEOUT, 5.0),
+            )
+            return response.is_success
+        except httpx.HTTPError:
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Factoría de LLM
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
-def get_llm():
+def get_llm() -> Any:
     """
     Devuelve la instancia de ChatOllama configurada.
     Cacheada para reutilizar la misma instancia en todos los agentes.
-
-    Requiere que el servidor Ollama esté corriendo (`ollama serve`,
-    normalmente arrancado automáticamente al instalar la app) y que
-    el modelo esté descargado (`ollama pull <modelo>`).
     """
     from langchain_ollama import ChatOllama
 
@@ -89,4 +103,5 @@ def get_llm():
         base_url=Settings.OLLAMA_BASE_URL,
         temperature=Settings.LLM_TEMPERATURE,
         num_predict=Settings.LLM_MAX_TOKENS,
+        client_kwargs={"timeout": Settings.LLM_REQUEST_TIMEOUT},
     )

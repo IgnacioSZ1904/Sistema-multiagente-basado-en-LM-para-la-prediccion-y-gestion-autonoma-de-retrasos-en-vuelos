@@ -215,10 +215,16 @@ def analytical_agent(state: SGIDAState) -> dict:
     En caso de error, escribe en `error` en lugar de lanzar excepción,
     permitiendo que el supervisor redirija al agente de comunicación.
     """
+    if not Settings.ollama_available() and not state.get("error"):
+        return {
+            "analytics_result": AnalyticsResult(summary_stats={"mode": "degraded"}),
+            "messages": [AIMessage(content="Ollama no está disponible; se devuelve modo degradado con routing determinista.")],
+        }
+
     try:
         messages = _run_react_loop(
             user_query=state["user_query"],
-                flight_context=state.get("flight_context"),
+            flight_context=state.get("flight_context"),
         )
         output = _synthesize(messages, state["user_query"])
 

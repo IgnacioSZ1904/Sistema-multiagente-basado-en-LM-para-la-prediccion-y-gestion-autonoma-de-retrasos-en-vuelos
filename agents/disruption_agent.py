@@ -173,6 +173,19 @@ def disruption_agent(state: SGIDAState) -> dict:
 
     En caso de error, escribe en `error` en lugar de lanzar excepción.
     """
+    if not Settings.ollama_available() and not state.get("error"):
+        return {
+            "disruption_proposal": DisruptionProposal(
+                proposal_id=f"PROP-{uuid.uuid4().hex[:8]}",
+                severity="medium",
+                actions=["Revisar manualmente la disrupción en el panel operativo"],
+                affected_passengers_est=0,
+                alternative_flights=[],
+                reasoning="Ollama no está disponible; propuesta mínima generada en modo degradado.",
+            ),
+            "messages": [AIMessage(content="Modo degradado activado para disrupciones.")],
+        }
+
     try:
         messages = _run_react_loop(
             user_query=state["user_query"],
