@@ -1,6 +1,7 @@
 # Credenciales y entorno
 .env
-venv/
+.venv/*
+venv/*
 .python-version
 data/*.duckdb
 
@@ -15,3 +16,5 @@ __pycache__/
 # Documentación temporal o de Office
 ~$*.docx
 *.pdf
+
+frontend/node_modules/*
