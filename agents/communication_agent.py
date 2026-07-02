@@ -18,6 +18,8 @@ que no necesita Pydantic porque `final_response` es un str.
 
 from __future__ import annotations
 
+import json
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config.settings import Settings, get_llm
@@ -41,11 +43,11 @@ def _build_context_block(state: SGIDAState) -> str:
     if state.get("error"):
         lines.append(f"Error reportado por un agente previo: {state['error']}")
     if state.get("analytics_result"):
-        lines.append(f"Resultado analítico exploratorio: {state['analytics_result']}")
+        lines.append(f"analytics_result (JSON): {json.dumps(state['analytics_result'], ensure_ascii=False)}")
     if state.get("delay_prediction"):
-        lines.append(f"Predicción de retraso: {state['delay_prediction']}")
+        lines.append(f"delay_prediction (JSON): {json.dumps(state['delay_prediction'], ensure_ascii=False)}")
     if state.get("disruption_proposal"):
-        lines.append(f"Propuesta de disrupción: {state['disruption_proposal']}")
+        lines.append(f"disruption_proposal (JSON): {json.dumps(state['disruption_proposal'], ensure_ascii=False)}")
 
     if len(lines) == 1:
         lines.append(

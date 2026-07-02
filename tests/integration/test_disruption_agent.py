@@ -195,6 +195,42 @@ class TestDisruptionAgentToolUsage:
         assert react_llm.invoke.call_count == 4  # _MAX_TOOL_CALLS del agente
 
 
+class TestDisruptionAgentJSONContext:
+    """Integración: el contexto pasado al LLM va serializado como JSON explícito."""
+
+    @patch("agents.disruption_agent.get_llm")
+    def test_analytics_result_is_serialized_as_json_in_the_prompt(
+        self, mock_get_llm, state_with_disruption_prediction, sample_analytics_result
+    ):
+        react_llm = MagicMock()
+        react_llm.invoke.return_value = _make_ai_message_no_tool_call()
+
+        structured_llm = MagicMock()
+        structured_llm.invoke.return_value = DisruptionOutput(
+            severity="medium",
+            actions=["Acción de prueba"],
+            affected_passengers_est=50,
+            alternative_flights=[],
+            reasoning="Razonamiento de prueba.",
+        )
+
+        base_llm = MagicMock()
+        base_llm.bind_tools.return_value = react_llm
+        base_llm.with_structured_output.return_value = structured_llm
+        mock_get_llm.return_value = base_llm
+
+        state = _copy_state(state_with_disruption_prediction)
+        state["analytics_result"] = sample_analytics_result
+
+        disruption_agent(state)
+
+        # El primer mensaje humano del bucle ReAct debe contener el JSON
+        # (no el repr() de un dict de Python) de analytics_result.
+        human_message = react_llm.invoke.call_args_list[0].args[0][1]
+        assert '"tools_used"' in human_message.content
+        assert "{'tools_used'" not in human_message.content  # no es un repr() de dict
+
+
 class TestDisruptionAgentErrorHandling:
     """Integración: degradación a state['error'] en caso de fallo."""
 

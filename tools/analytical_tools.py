@@ -226,7 +226,7 @@ def get_delay_causes_breakdown() -> str:
 
 
 @tool
-def predict_flight_delay(
+def get_flight_historical_stats(
     airline: str,
     origin: str,
     destination: str,
@@ -234,10 +234,13 @@ def predict_flight_delay(
     scheduled_dep: int,
 ) -> str:
     """
-    Estima el retraso esperado para un vuelo dado basándose en históricos.
+    Devuelve estadísticas históricas agregadas para un vuelo concreto.
 
-    Calcula el retraso medio y la tasa de disrupción para vuelos con las
-    mismas características (aerolínea, ruta, mes y franja horaria similar).
+    Datos puramente factuales (sin interpretación): retraso medio histórico
+    y causa dominante para vuelos con las mismas características (aerolínea,
+    ruta, mes y franja horaria similar). La interpretación (si constituye
+    una disrupción, nivel de confianza, etc.) se calcula después, de forma
+    determinista, a partir de estos hechos.
 
     Args:
         airline:       Código de aerolínea (Marketing_Airline_Network, ej. "AA").
@@ -247,8 +250,8 @@ def predict_flight_delay(
         scheduled_dep: Hora de salida programada en formato HHMM (ej. 830).
 
     Returns:
-        JSON con campos: avg_dep_delay_min, avg_arr_delay_min, pct_disrupted,
-        sample_size, main_cause.
+        JSON con campos: avg_dep_delay_min, avg_arr_delay_min,
+        pct_over_threshold, sample_size, dominant_delay_cause.
     """
     dep_hour = scheduled_dep // 100
     sql = f"""
@@ -285,7 +288,7 @@ def predict_flight_delay(
             ROUND(
                 100.0 * SUM(CASE WHEN b.ArrDelayMinutes > {Settings.DELAY_THRESHOLD_MINUTES}
                                  THEN 1 ELSE 0 END) / COUNT(*), 2
-            )                                   AS pct_disrupted,
+            )                                   AS pct_over_threshold,
             COUNT(*)                            AS sample_size,
             (SELECT
                 CASE
@@ -303,7 +306,7 @@ def predict_flight_delay(
                          THEN 'late_aircraft'
                     ELSE 'security'
                 END
-             FROM causes)                       AS main_cause
+             FROM causes)                       AS dominant_delay_cause
         FROM base b
     """
     rows = _query(sql)
@@ -312,35 +315,36 @@ def predict_flight_delay(
             "error": "Sin datos históricos suficientes para esta combinación.",
             "avg_dep_delay_min": None,
             "avg_arr_delay_min": None,
-            "pct_disrupted": None,
+            "pct_over_threshold": None,
             "sample_size": 0,
-            "main_cause": "unknown",
+            "dominant_delay_cause": "unknown",
         }, ensure_ascii=False)
     return json.dumps(rows[0], ensure_ascii=False)
 
 
 @tool
-def get_cascade_risk_flights(
+def get_cascade_risk_context(
     origin: str,
     flight_date: str,
     dep_hour: int,
     delay_minutes: float,
 ) -> str:
     """
-    Identifica vuelos con riesgo de efecto cascada dado un retraso inicial.
+    Devuelve contexto histórico sobre vuelos con exposición a efecto cascada.
 
-    Busca vuelos que salgan del mismo aeropuerto en las 2 horas siguientes
-    al retraso, operados por la misma aerolínea, que históricamente se ven
-    afectados por retrasos de aeronave tardía (LateAircraftDelay).
+    Datos puramente descriptivos (sin interpretación de riesgo): vuelos que
+    salen del mismo aeropuerto en las 2 horas siguientes, operados por la
+    misma aerolínea, que históricamente se han visto afectados por retrasos
+    de aeronave tardía (LateAircraftDelay).
 
     Args:
         origin:        Ciudad del aeropuerto afectado (ej. "Chicago, IL").
         flight_date:   Fecha en formato YYYY-MM-DD (ej. "2018-03-10").
-        dep_hour:      Hora de salida del vuelo retrasado (0-23).
-        delay_minutes: Minutos de retraso del vuelo inicial.
+        dep_hour:      Hora de salida del vuelo de referencia (0-23).
+        delay_minutes: Minutos de retraso del vuelo de referencia.
 
     Returns:
-        JSON con lista de vuelos en riesgo: destination, airline,
+        JSON con lista de vuelos: destination, airline,
         scheduled_dep, avg_late_aircraft_delay_min, total_flights.
     """
     # Extraemos mes para filtrar histórico similar
@@ -383,6 +387,6 @@ ANALYTICAL_TOOLS = [
     get_delay_by_month,
     get_delay_by_hour,
     get_delay_causes_breakdown,
-    predict_flight_delay,
-    get_cascade_risk_flights,
+    get_flight_historical_stats,
+    get_cascade_risk_context,
 ]

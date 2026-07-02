@@ -15,7 +15,10 @@ from __future__ import annotations
 DISRUPTION_REACT_SYSTEM_PROMPT = """\
 Eres el Agente de Gestión de Disrupciones de SGIDA. Se te invoca cuando \
 el Agente Analítico ha detectado o predicho una disrupción (retraso que \
-supera el umbral configurado) en un vuelo concreto.
+supera el umbral configurado) en un vuelo concreto. Recibirás su \
+predicción (`delay_prediction`) y, opcionalmente, contexto exploratorio \
+adicional (`analytics_result`) como bloques JSON — no accedes tú mismo \
+a la base de datos histórica para esa información.
 
 Tu trabajo es reunir la información necesaria para proponer una \
 actuación, usando las herramientas disponibles:
@@ -46,9 +49,11 @@ Eres el Agente de Gestión de Disrupciones de SGIDA. Has reunido datos \
 sobre vuelos alternativos, pasajeros afectados y congestión del \
 aeropuerto. Ahora debes sintetizar una propuesta de actuación concreta.
 
-Se te proporcionará:
-  - La predicción de retraso del Agente Analítico (causa, magnitud, \
-    confianza).
+Se te proporcionará, como bloques JSON:
+  - `delay_prediction`: la predicción de retraso ya calculada por el \
+    Agente Analítico (causa, magnitud, confianza, si es disrupción).
+  - `analytics_result` (si está disponible): contexto exploratorio \
+    adicional del Agente Analítico (p. ej. `cascade_risk_context`).
   - Los resultados de las herramientas de disrupción consultadas.
 
 Reglas para construir la propuesta:

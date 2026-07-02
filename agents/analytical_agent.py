@@ -4,113 +4,91 @@ agents/analytical_agent.py
 Agente Analítico de SGIDA.
 
 Responsabilidad: procesar el histórico de vuelos para identificar
-patrones de retraso (modo exploratorio) o predecir el retraso esperado
-de un vuelo concreto y su riesgo de efecto cascada (modo predictivo).
+patrones de retraso (rutas, aeropuertos, franjas horarias, causas) y,
+cuando la consulta trae un vuelo concreto, calcular estadísticas
+históricas y una predicción de retraso. La salida es SIEMPRE JSON
+estructurado (`AnalyticsResult` / `DelayPrediction`) — este agente
+nunca redacta texto en lenguaje natural para el operador; ese JSON es
+lo que consumen `disruption_agent` (gestión de la disrupción) y
+`communication_agent` (traducción a lenguaje natural).
 
-Diseño en dos fases (decisión documentada en la memoria del TFG):
+Diseño en una sola fase con LLM (decisión documentada en la memoria
+del TFG):
 -------------------------------------------------------------------
 Con Ollama como backend local, combinar `bind_tools()` (tool-calling)
 y `with_structured_output()` (salida Pydantic) en una sola llamada es
-poco fiable: el modelo tiende a confundir el esquema de la herramienta
-con el esquema de salida. Por ello se separan en dos llamadas:
+poco fiable. La versión anterior de este agente resolvía esto con dos
+llamadas LLM (ReAct + síntesis estructurada). Esa segunda llamada, sin
+embargo, era redundante: las tools ya devuelven JSON con el shape
+exacto que necesita el estado, así que pedirle al LLM que las
+"reescriba" en un schema Pydantic solo añadía latencia y riesgo de que
+transcribiera mal los números. Por eso aquí la fase de síntesis se
+sustituye por un ENSAMBLAJE DETERMINISTA en código:
 
   FASE 1 (ReAct manual): el LLM con herramientas vinculadas decide qué
           consultas ejecutar contra DuckDB, en un bucle controlado por
-          este código (no por un prebuilt de LangGraph), hasta que deja
-          de solicitar herramientas o se alcanza el máximo de iteraciones.
+          este código, hasta que deja de solicitar herramientas o se
+          alcanza el máximo de turnos.
 
-  FASE 2 (síntesis estructurada): con el LLM SIN herramientas vinculadas
-          pero con `with_structured_output(AnalyticalOutput)`, se sintetiza
-          todo lo observado en la Fase 1 en un objeto Pydantic validado,
-          que se traduce a los campos del SGIDAState.
+  FASE 2 (ensamblaje determinista): cada resultado de tool ya es JSON
+          válido con el shape del campo de `AnalyticsResult` al que
+          corresponde — se mapea `nombre_de_tool -> campo` y se hace
+          `json.loads()`, sin ninguna llamada adicional al LLM. Si la
+          consulta trajo estadísticas de un vuelo concreto
+          (`flight_historical_stats`), se deriva además `delay_prediction`
+          con una heurística determinista (umbral de disrupción +
+          confianza según tamaño de muestra + causa dominante ya
+          calculada por SQL).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Any
+import json
+from typing import Any, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from pydantic import BaseModel, Field
 
 from config.settings import Settings, get_llm
 from graph.state import AnalyticsResult, DelayPrediction, SGIDAState
-from prompts.analytical_prompt import (
-    ANALYTICAL_REACT_SYSTEM_PROMPT,
-    ANALYTICAL_STRUCTURED_SYSTEM_PROMPT,
-)
+from prompts.analytical_prompt import ANALYTICAL_REACT_SYSTEM_PROMPT
 from tools.analytical_tools import ANALYTICAL_TOOLS
 
-# Máximo de llamadas a herramientas dentro de la fase ReAct de este agente.
-# Distinto de Settings.GRAPH_MAX_ITERATIONS, que limita el grafo completo.
-_MAX_TOOL_CALLS = 5
+# Máximo de turnos ReAct (llamadas al LLM) dentro de este agente. Un turno
+# puede incluir varias tool_calls en paralelo. Distinto de
+# Settings.GRAPH_MAX_ITERATIONS, que limita el grafo completo.
+_MAX_REACT_TURNS = 3
 
 _TOOLS_BY_NAME = {t.name: t for t in ANALYTICAL_TOOLS}
 
-
-# ---------------------------------------------------------------------------
-# Esquema de salida estructurada (Fase 2)
-# ---------------------------------------------------------------------------
-
-class AnalyticalOutput(BaseModel):
-    """
-    Salida estructurada del agente analítico. Se traduce a
-    DelayPrediction o AnalyticsResult según `response_mode`.
-    """
-
-    response_mode: str = Field(
-        description='Modo de respuesta: "prediction" si la consulta era '
-        'sobre un vuelo concreto, "exploratory" si era un análisis general.'
-    )
-
-    # --- Campos de modo "prediction" (rellenar solo si aplica) ----------
-    expected_dep_delay_min: Optional[float] = Field(
-        default=None, description="Retraso estimado en salida (minutos)."
-    )
-    expected_arr_delay_min: Optional[float] = Field(
-        default=None, description="Retraso estimado en llegada (minutos)."
-    )
-    is_disruption: Optional[bool] = Field(
-        default=None,
-        description="True si el retraso estimado supera el umbral de disrupción.",
-    )
-    confidence: Optional[float] = Field(
-        default=None, description="Confianza de la predicción, entre 0.0 y 1.0."
-    )
-    main_cause: Optional[str] = Field(
-        default=None,
-        description='Causa principal: "carrier" | "weather" | "nas" | '
-        '"security" | "late_aircraft" | "unknown".',
-    )
-
-    # --- Campo de modo "exploratory" -------------------------------------
-    exploratory_summary: Optional[dict] = Field(
-        default=None,
-        description="Resultados clave del análisis exploratorio, "
-        "estructurados como un diccionario libre con los hallazgos "
-        "más relevantes (p.ej. top_delay_airports, delay_causes_pct...).",
-    )
-
-    narrative_summary: str = Field(
-        description="Resumen en 2-4 frases de los hallazgos, en lenguaje "
-        "natural, para que el agente de comunicación lo use como base."
-    )
+# Mapa determinista tool -> campo de AnalyticsResult que rellena.
+_TOOL_NAME_TO_FIELD = {
+    "get_top_delay_airports": "top_delay_airports",
+    "get_top_delay_airlines": "top_delay_airlines",
+    "get_top_delay_routes": "top_delay_routes",
+    "get_delay_by_month": "delay_by_month",
+    "get_delay_by_hour": "delay_by_hour",
+    "get_delay_causes_breakdown": "delay_causes_breakdown",
+    "get_flight_historical_stats": "flight_historical_stats",
+    "get_cascade_risk_context": "cascade_risk_context",
+}
 
 
 # ---------------------------------------------------------------------------
 # Fase 1 — Bucle ReAct manual
 # ---------------------------------------------------------------------------
 
-def _run_react_loop(user_query: str, flight_context: Any | None) -> list:
+def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[str, str]]:
     """
     Ejecuta el bucle ReAct manual: el LLM decide qué herramientas llamar,
-    este código las ejecuta y devuelve los resultados al LLM, hasta que
-    el LLM no solicita más herramientas o se alcanza _MAX_TOOL_CALLS.
+    este código las ejecuta, hasta que el LLM no solicita más
+    herramientas o se alcanza _MAX_REACT_TURNS.
 
     Returns
     -------
-    list[BaseMessage]
-        Historial completo de mensajes generado durante el bucle
-        (incluye AIMessages con tool_calls y los ToolMessages de resultado).
+    list[tuple[str, str]]
+        Pares (nombre_de_tool, resultado_json) de cada tool invocada, en
+        el orden de ejecución. Es la entrada del ensamblaje determinista
+        de la fase 2 (ver _assemble_analytics_result).
     """
     llm_with_tools = get_llm().bind_tools(ANALYTICAL_TOOLS)
 
@@ -124,7 +102,9 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list:
         HumanMessage(content=f"Consulta del operador: {user_query}{context_line}"),
     ]
 
-    for step in range(_MAX_TOOL_CALLS):
+    tool_results: list[tuple[str, str]] = []
+
+    for _ in range(_MAX_REACT_TURNS):
         response: AIMessage = llm_with_tools.invoke(messages)
         messages.append(response)
 
@@ -145,58 +125,97 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list:
                 except Exception as exc:  # noqa: BLE001
                     result_content = f"Error ejecutando '{tool_name}': {exc}"
 
+            tool_results.append((tool_name, str(result_content)))
             messages.append(
                 ToolMessage(content=str(result_content), tool_call_id=tool_call["id"])
             )
     else:
-        # Se alcanzó _MAX_TOOL_CALLS sin que el LLM se detuviera por sí mismo.
+        # Se alcanzó _MAX_REACT_TURNS sin que el LLM se detuviera por sí mismo.
         if Settings.DEBUG_MODE:
             print(
-                f"[analytical_agent] Límite de {_MAX_TOOL_CALLS} llamadas "
-                "a herramientas alcanzado; forzando síntesis con lo disponible."
+                f"[analytical_agent] Límite de {_MAX_REACT_TURNS} turnos "
+                "ReAct alcanzado; se ensambla el resultado con lo disponible."
             )
 
-    return messages
+    return tool_results
 
 
 # ---------------------------------------------------------------------------
-# Fase 2 — Síntesis estructurada
+# Fase 2 — Ensamblaje determinista (sin LLM)
 # ---------------------------------------------------------------------------
 
-def _synthesize(messages: list, user_query: str) -> AnalyticalOutput:
+def _assemble_analytics_result(tool_results: list[tuple[str, str]]) -> AnalyticsResult:
     """
-    Toma el historial de la fase ReAct y produce la salida estructurada
-    final, usando el LLM sin herramientas pero con schema Pydantic forzado.
+    Construye AnalyticsResult a partir de los resultados JSON que ya
+    devolvieron las herramientas, sin pasar por el LLM. Cada tool
+    devuelve exactamente el shape que espera su campo correspondiente
+    (ver _TOOL_NAME_TO_FIELD); si una tool se invocó más de una vez,
+    gana la última invocación.
     """
-    structured_llm = get_llm().with_structured_output(AnalyticalOutput)
+    result: AnalyticsResult = {}
+    tools_used: list[str] = []
 
-    # Construimos un resumen textual de las observaciones (resultados de
-    # herramientas) en lugar de pasar el historial completo de mensajes,
-    # para evitar confundir al modelo con tool_calls en esta segunda fase.
-    observations = []
-    for msg in messages:
-        if isinstance(msg, ToolMessage):
-            observations.append(f"- {msg.content}")
+    for tool_name, content in tool_results:
+        tools_used.append(tool_name)
+        field = _TOOL_NAME_TO_FIELD.get(tool_name)
+        if field is None:
+            continue
+        try:
+            parsed = json.loads(content)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        result[field] = parsed  # type: ignore[literal-required]
 
-    observations_text = (
-        "\n".join(observations) if observations
-        else "No se obtuvieron resultados de ninguna herramienta."
+    result["tools_used"] = tools_used
+    return result
+
+
+def _derive_delay_prediction(analytics_result: AnalyticsResult) -> Optional[DelayPrediction]:
+    """
+    Deriva la predicción de retraso de forma determinista a partir de
+    `flight_historical_stats` (si esa tool fue invocada). Sin
+    interpretación del LLM:
+
+    - `is_disruption`: el retraso medio en llegada supera el umbral
+      configurado (Settings.DELAY_THRESHOLD_MINUTES).
+    - `confidence`: heurística por tramos de `sample_size` (menos de 30
+      vuelos históricos comparables -> confianza baja; más de 200 ->
+      confianza alta).
+    - `main_cause`: la causa dominante ya calculada por SQL en la tool
+      (`dominant_delay_cause`), no una interpretación adicional.
+
+    Devuelve None si no se consultaron estadísticas de un vuelo concreto.
+    """
+    stats = analytics_result.get("flight_historical_stats")
+    if not stats:
+        return None
+
+    sample_size = stats.get("sample_size") or 0
+    avg_arr = stats.get("avg_arr_delay_min")
+
+    if sample_size == 0 or avg_arr is None:
+        return DelayPrediction(
+            expected_dep_delay_min=0.0,
+            expected_arr_delay_min=0.0,
+            is_disruption=False,
+            confidence=0.0,
+            main_cause="unknown",
+        )
+
+    if sample_size < 30:
+        confidence = round(0.3 + 0.2 * (sample_size / 30), 2)
+    elif sample_size <= 200:
+        confidence = round(0.5 + 0.3 * ((sample_size - 30) / 170), 2)
+    else:
+        confidence = round(min(0.8 + 0.15 * ((sample_size - 200) / 800), 0.95), 2)
+
+    return DelayPrediction(
+        expected_dep_delay_min=stats.get("avg_dep_delay_min") or 0.0,
+        expected_arr_delay_min=avg_arr,
+        is_disruption=avg_arr > Settings.DELAY_THRESHOLD_MINUTES,
+        confidence=confidence,
+        main_cause=stats.get("dominant_delay_cause") or "unknown",
     )
-
-    synthesis_prompt = (
-        f"Consulta original del operador: {user_query}\n\n"
-        f"Resultados obtenidos de las herramientas consultadas:\n"
-        f"{observations_text}\n\n"
-        f"Umbral de disrupción configurado: {Settings.DELAY_THRESHOLD_MINUTES} minutos.\n\n"
-        "Sintetiza estos resultados en la salida estructurada solicitada."
-    )
-
-    result = structured_llm.invoke([
-        SystemMessage(content=ANALYTICAL_STRUCTURED_SYSTEM_PROMPT),
-        HumanMessage(content=synthesis_prompt),
-    ])
-
-    return AnalyticalOutput.parse_obj(result)
 
 
 # ---------------------------------------------------------------------------
@@ -208,47 +227,47 @@ def analytical_agent(state: SGIDAState) -> dict:
     Nodo LangGraph del agente analítico.
 
     Lee `user_query` y `flight_context` del estado, ejecuta el bucle
-    ReAct sobre las herramientas analíticas, sintetiza el resultado y
-    devuelve un diccionario parcial para actualizar el estado con
-    `delay_prediction` o `analytics_result`, según corresponda.
+    ReAct sobre las herramientas analíticas, ensambla `analytics_result`
+    de forma determinista y, si hay estadísticas de un vuelo concreto,
+    deriva `delay_prediction`. Nunca escribe texto en lenguaje natural
+    dirigido al operador; el único mensaje que añade al canal
+    `messages` es una traza técnica construida en código (no por el
+    LLM), para depuración.
 
     En caso de error, escribe en `error` en lugar de lanzar excepción,
     permitiendo que el supervisor redirija al agente de comunicación.
     """
     if not Settings.ollama_available() and not state.get("error"):
         return {
-            "analytics_result": AnalyticsResult(summary_stats={"mode": "degraded"}),
-            "messages": [AIMessage(content="Ollama no está disponible; se devuelve modo degradado con routing determinista.")],
+            "analytics_result": AnalyticsResult(tools_used=[]),
+            "messages": [
+                AIMessage(content="[analytical_agent] Ollama no disponible; modo degradado, sin consultas realizadas.")
+            ],
         }
 
     try:
-        messages = _run_react_loop(
+        tool_results = _run_react_loop(
             user_query=state["user_query"],
             flight_context=state.get("flight_context"),
         )
-        output = _synthesize(messages, state["user_query"])
+        analytics_result = _assemble_analytics_result(tool_results)
+        delay_prediction = _derive_delay_prediction(analytics_result)
 
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Error en analytical_agent: {exc}"}
 
-    update: dict = {}
+    tools_used = analytics_result.get("tools_used", [])
+    trace_text = (
+        f"[analytical_agent] tools consultadas: {', '.join(tools_used)}"
+        if tools_used
+        else "[analytical_agent] no se consultó ninguna herramienta."
+    )
 
-    if output.response_mode == "prediction":
-        update["delay_prediction"] = DelayPrediction(
-            expected_dep_delay_min=output.expected_dep_delay_min or 0.0,
-            expected_arr_delay_min=output.expected_arr_delay_min or 0.0,
-            is_disruption=bool(output.is_disruption),
-            confidence=output.confidence or 0.0,
-            main_cause=output.main_cause or "unknown",
-        )
-    else:
-        update["analytics_result"] = AnalyticsResult(
-            summary_stats=output.exploratory_summary or {},
-        )
-
-    # El resumen narrativo se añade al canal de mensajes para que el
-    # agente de comunicación (y el operador, en modo debug) tenga
-    # visibilidad del razonamiento intermedio.
-    update["messages"] = [AIMessage(content=output.narrative_summary)]
+    update: dict = {
+        "analytics_result": analytics_result,
+        "messages": [AIMessage(content=trace_text)],
+    }
+    if delay_prediction is not None:
+        update["delay_prediction"] = delay_prediction
 
     return update

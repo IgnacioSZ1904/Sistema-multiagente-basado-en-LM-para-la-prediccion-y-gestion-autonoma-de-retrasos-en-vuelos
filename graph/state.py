@@ -28,7 +28,7 @@ LateAircraftDelay               DOUBLE
 
 from __future__ import annotations
 
-from typing import Annotated, Any, Optional
+from typing import Annotated, Optional
 from typing_extensions import TypedDict
 
 from langchain_core.messages import BaseMessage
@@ -78,19 +78,94 @@ class DisruptionProposal(TypedDict):
     reasoning: str                     # Razonamiento del agente
 
 
+class RouteStat(TypedDict):
+    """Estadística de retraso para una ruta origen-destino."""
+    origin: str
+    destination: str
+    avg_arr_delay_min: float
+    total_flights: int
+
+
+class AirportStat(TypedDict):
+    """Estadística de retraso para un aeropuerto de origen."""
+    origin: str
+    avg_dep_delay_min: float
+    total_flights: int
+    pct_delayed: float
+
+
+class AirlineStat(TypedDict):
+    """Estadística de retraso para una aerolínea."""
+    airline: str
+    avg_arr_delay_min: float
+    total_flights: int
+    pct_delayed: float
+
+
+class HourStat(TypedDict):
+    """Estadística de retraso para una franja horaria de salida (0-23)."""
+    hour: int
+    avg_dep_delay_min: float
+    total_flights: int
+
+
+class MonthStat(TypedDict):
+    """Estadística de retraso para un mes (1-12)."""
+    month: int
+    avg_arr_delay_min: float
+    total_flights: int
+
+
+class CauseStat(TypedDict):
+    """Desglose del porcentaje de minutos de retraso por causa."""
+    cause: str              # "carrier" | "weather" | "nas" | "security" | "late_aircraft"
+    total_minutes: float
+    pct: float
+
+
+class FlightHistoricalStats(TypedDict):
+    """
+    Estadísticas históricas agregadas para un vuelo concreto
+    (aerolínea + ruta + mes + franja horaria). Puramente factual:
+    `dominant_delay_cause` es la causa que más minutos de retraso ha
+    acumulado históricamente en esa combinación, no una predicción.
+    """
+    airline: str
+    origin: str
+    destination: str
+    month: int
+    scheduled_dep: int
+    avg_dep_delay_min: Optional[float]
+    avg_arr_delay_min: Optional[float]
+    pct_over_threshold: Optional[float]
+    sample_size: int
+    dominant_delay_cause: str
+
+
+class CascadeRiskFlight(TypedDict):
+    """Vuelo con exposición histórica a retraso de aeronave tardía."""
+    destination: str
+    airline: str
+    scheduled_dep: int
+    avg_late_aircraft_delay_min: float
+    total_flights: int
+
+
 class AnalyticsResult(TypedDict, total=False):
     """
     Resultados de consultas analíticas sobre el dataset histórico.
-    Los campos son opcionales porque cada consulta devuelve un subconjunto.
+    Todos los campos son opcionales: cada consulta rellena solo los
+    que corresponden a las herramientas invocadas por el agente analítico.
     """
-    top_delay_airports: list[dict[str, Any]]    # Aeropuertos con más retrasos
-    top_delay_airlines: list[dict[str, Any]]    # Aerolíneas con más retrasos
-    top_delay_routes: list[dict[str, Any]]      # Rutas más problemáticas
-    delay_by_month: list[dict[str, Any]]        # Retraso medio por mes
-    delay_by_hour: list[dict[str, Any]]         # Retraso medio por franja horaria
-    delay_causes_pct: dict[str, float]          # % por causa (carrier/weather/…)
-    cascade_risk_flights: list[dict[str, Any]]  # Vuelos con riesgo de efecto cascada
-    summary_stats: dict[str, Any]               # Estadísticas globales del dataset
+    top_delay_routes: list[RouteStat]
+    top_delay_airports: list[AirportStat]
+    top_delay_airlines: list[AirlineStat]
+    delay_by_hour: list[HourStat]
+    delay_by_month: list[MonthStat]
+    delay_causes_breakdown: list[CauseStat]
+    flight_historical_stats: FlightHistoricalStats
+    cascade_risk_context: list[CascadeRiskFlight]
+    tools_used: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +212,9 @@ class SGIDAState(TypedDict):
     # Rellenado por analytical_agent tras consultas al dataset histórico.
 
     delay_prediction: Optional[DelayPrediction]
-    # Rellenado por analytical_agent tras predecir el retraso de un vuelo.
+    # Rellenado por analytical_agent de forma determinista (umbral de
+    # disrupción + heurística de confianza según tamaño de muestra) a
+    # partir de `flight_historical_stats`, no por interpretación del LLM.
 
     disruption_proposal: Optional[DisruptionProposal]
     # Rellenado por disruption_agent con las acciones propuestas.

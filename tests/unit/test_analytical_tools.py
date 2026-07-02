@@ -22,13 +22,14 @@ import pytest
 
 from tools.analytical_tools import (
     ANALYTICAL_TOOLS,
+    get_cascade_risk_context,
     get_delay_by_hour,
     get_delay_by_month,
     get_delay_causes_breakdown,
+    get_flight_historical_stats,
     get_top_delay_airlines,
     get_top_delay_airports,
     get_top_delay_routes,
-    predict_flight_delay,
 )
 
 
@@ -185,12 +186,12 @@ class TestGetDelayCausesBreakdown:
         assert pcts == sorted(pcts, reverse=True)
 
 
-class TestPredictFlightDelay:
-    """Tests de predict_flight_delay."""
+class TestGetFlightHistoricalStats:
+    """Tests de get_flight_historical_stats (datos puramente factuales)."""
 
     def test_returns_error_structure_for_nonexistent_combination(self):
         # Combinación inventada que no debería existir en el dataset real.
-        result = predict_flight_delay.invoke({
+        result = get_flight_historical_stats.invoke({
             "airline": "ZZ",
             "origin": "Ciudad Inexistente, XX",
             "destination": "Otra Ciudad Inexistente, YY",
@@ -199,13 +200,13 @@ class TestPredictFlightDelay:
         })
         data = json.loads(result)
         assert data["sample_size"] == 0
-        assert data["main_cause"] == "unknown"
+        assert data["dominant_delay_cause"] == "unknown"
         assert "error" in data
 
     def test_returns_expected_fields_structure(self):
         # Probamos con parámetros genéricos; no garantizamos que existan
         # datos, pero la estructura de la respuesta debe ser siempre la misma.
-        result = predict_flight_delay.invoke({
+        result = get_flight_historical_stats.invoke({
             "airline": "AA",
             "origin": "Chicago, IL",
             "destination": "Denver, CO",
@@ -215,12 +216,12 @@ class TestPredictFlightDelay:
         data = json.loads(result)
         expected_keys = {
             "avg_dep_delay_min", "avg_arr_delay_min",
-            "pct_disrupted", "sample_size", "main_cause",
+            "pct_over_threshold", "sample_size", "dominant_delay_cause",
         }
         assert expected_keys.issubset(data.keys())
 
-    def test_main_cause_is_one_of_expected_values(self):
-        result = predict_flight_delay.invoke({
+    def test_dominant_delay_cause_is_one_of_expected_values(self):
+        result = get_flight_historical_stats.invoke({
             "airline": "AA",
             "origin": "Chicago, IL",
             "destination": "Denver, CO",
@@ -228,6 +229,36 @@ class TestPredictFlightDelay:
             "scheduled_dep": 1400,
         })
         data = json.loads(result)
-        assert data["main_cause"] in {
+        assert data["dominant_delay_cause"] in {
             "carrier", "weather", "nas", "security", "late_aircraft", "unknown"
         }
+
+
+class TestGetCascadeRiskContext:
+    """Tests de get_cascade_risk_context."""
+
+    def test_returns_valid_json_list(self):
+        result = get_cascade_risk_context.invoke({
+            "origin": "Chicago, IL",
+            "flight_date": "2018-03-10",
+            "dep_hour": 14,
+            "delay_minutes": 45.0,
+        })
+        data = json.loads(result)
+        assert isinstance(data, list)
+
+    def test_each_row_has_expected_fields(self):
+        result = get_cascade_risk_context.invoke({
+            "origin": "Chicago, IL",
+            "flight_date": "2018-03-10",
+            "dep_hour": 14,
+            "delay_minutes": 45.0,
+        })
+        data = json.loads(result)
+        if data:
+            row = data[0]
+            assert "destination" in row
+            assert "airline" in row
+            assert "scheduled_dep" in row
+            assert "avg_late_aircraft_delay_min" in row
+            assert "total_flights" in row

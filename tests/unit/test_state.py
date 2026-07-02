@@ -149,8 +149,8 @@ class TestAnalyticsResult:
     """Tests de construcción del TypedDict AnalyticsResult (total=False)."""
 
     def test_analytics_result_accepts_partial_fields(self):
-        result = AnalyticsResult(delay_causes_pct={"weather": 20.0})
-        assert result["delay_causes_pct"]["weather"] == 20.0
+        result = AnalyticsResult(tools_used=["get_delay_causes_breakdown"])
+        assert result["tools_used"] == ["get_delay_causes_breakdown"]
 
     def test_analytics_result_accepts_empty_construction(self):
         # total=False permite incluso un diccionario vacío.

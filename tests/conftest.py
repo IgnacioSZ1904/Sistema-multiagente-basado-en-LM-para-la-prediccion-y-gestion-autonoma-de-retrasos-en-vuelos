@@ -118,10 +118,16 @@ def sample_analytics_result() -> AnalyticsResult:
     """Resultado analítico exploratorio de ejemplo."""
     return AnalyticsResult(
         top_delay_airports=[
-            {"origin": "Chicago, IL", "avg_dep_delay_min": 18.4, "total_flights": 50000},
+            {"origin": "Chicago, IL", "avg_dep_delay_min": 18.4, "total_flights": 50000, "pct_delayed": 22.5},
         ],
-        delay_causes_pct={"carrier": 30.0, "weather": 15.0, "nas": 35.0,
-                          "security": 1.0, "late_aircraft": 19.0},
+        delay_causes_breakdown=[
+            {"cause": "nas", "total_minutes": 350000.0, "pct": 35.0},
+            {"cause": "carrier", "total_minutes": 300000.0, "pct": 30.0},
+            {"cause": "late_aircraft", "total_minutes": 190000.0, "pct": 19.0},
+            {"cause": "weather", "total_minutes": 150000.0, "pct": 15.0},
+            {"cause": "security", "total_minutes": 10000.0, "pct": 1.0},
+        ],
+        tools_used=["get_top_delay_airports", "get_delay_causes_breakdown"],
     )
 
 

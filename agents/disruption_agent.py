@@ -69,7 +69,12 @@ class DisruptionOutput(BaseModel):
 # Fase 1 — Bucle ReAct manual
 # ---------------------------------------------------------------------------
 
-def _run_react_loop(user_query: str, flight_context: Any, delay_prediction: Any = None) -> list:
+def _run_react_loop(
+    user_query: str,
+    flight_context: Any,
+    delay_prediction: Any = None,
+    analytics_result: Any = None,
+) -> list:
     """
     Ejecuta el bucle ReAct manual sobre las herramientas de disrupción.
     Ver analytical_agent._run_react_loop para la justificación del patrón.
@@ -78,9 +83,11 @@ def _run_react_loop(user_query: str, flight_context: Any, delay_prediction: Any 
 
     context_lines = [f"Consulta original del operador: {user_query}"]
     if flight_context:
-        context_lines.append(f"Contexto del vuelo: {flight_context}")
+        context_lines.append(f"Contexto del vuelo: {json.dumps(flight_context, ensure_ascii=False)}")
     if delay_prediction:
-        context_lines.append(f"Predicción del Agente Analítico: {delay_prediction}")
+        context_lines.append(f"delay_prediction (JSON, ya calculado por el Agente Analítico): {json.dumps(delay_prediction, ensure_ascii=False)}")
+    if analytics_result:
+        context_lines.append(f"analytics_result (JSON, contexto exploratorio del Agente Analítico): {json.dumps(analytics_result, ensure_ascii=False)}")
 
     messages: list = [
         SystemMessage(content=DISRUPTION_REACT_SYSTEM_PROMPT),
@@ -124,7 +131,11 @@ def _run_react_loop(user_query: str, flight_context: Any, delay_prediction: Any 
 # Fase 2 — Síntesis estructurada
 # ---------------------------------------------------------------------------
 
-def _synthesize(messages: list, delay_prediction: Any = None) -> DisruptionOutput:
+def _synthesize(
+    messages: list,
+    delay_prediction: Any = None,
+    analytics_result: Any = None,
+) -> DisruptionOutput:
     """Sintetiza las observaciones de la fase ReAct en una propuesta estructurada."""
     structured_llm = get_llm().with_structured_output(DisruptionOutput)
 
@@ -134,8 +145,16 @@ def _synthesize(messages: list, delay_prediction: Any = None) -> DisruptionOutpu
         else "No se obtuvieron resultados de ninguna herramienta de disrupción."
     )
 
+    delay_prediction_json = (
+        json.dumps(delay_prediction, ensure_ascii=False) if delay_prediction else "no disponible"
+    )
+    analytics_result_json = (
+        json.dumps(analytics_result, ensure_ascii=False) if analytics_result else "no disponible"
+    )
+
     synthesis_prompt = (
-        f"Predicción del Agente Analítico: {delay_prediction or 'no disponible'}\n\n"
+        f"delay_prediction (JSON): {delay_prediction_json}\n\n"
+        f"analytics_result (JSON): {analytics_result_json}\n\n"
         f"Resultados obtenidos de las herramientas de disrupción consultadas:\n"
         f"{observations_text}\n\n"
         "Sintetiza una propuesta de actuación estructurada."
@@ -191,8 +210,9 @@ def disruption_agent(state: SGIDAState) -> dict:
             user_query=state["user_query"],
             flight_context=state.get("flight_context"),
             delay_prediction=state.get("delay_prediction"),
+            analytics_result=state.get("analytics_result"),
         )
-        output = _synthesize(messages, state.get("delay_prediction"))
+        output = _synthesize(messages, state.get("delay_prediction"), state.get("analytics_result"))
 
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Error en disruption_agent: {exc}"}

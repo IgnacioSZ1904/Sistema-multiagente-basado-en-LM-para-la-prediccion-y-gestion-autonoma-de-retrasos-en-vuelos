@@ -3,16 +3,19 @@ tests/integration/test_analytical_agent.py
 ==============================================
 Tests de integración del agente analítico CON EL LLM MOCKEADO.
 
-No requieren Ollama corriendo. Se mockea get_llm() para devolver un
-doble que simula tanto la fase ReAct (bind_tools + tool_calls) como la
-fase de síntesis estructurada (with_structured_output), validando que
-analytical_agent() integra correctamente ambas fases con el estado del
-grafo y con tools/analytical_tools.py.
+No requieren Ollama corriendo. Se mockea get_llm() para simular
+únicamente la fase ReAct (bind_tools + tool_calls); ya NO existe una
+fase de síntesis con LLM — el ensamblaje de `analytics_result` y la
+derivación de `delay_prediction` son deterministas (código puro), así
+que se validan directamente sobre el resultado del nodo y, para la
+heurística de predicción, también de forma unitaria sobre
+`_derive_delay_prediction`.
 
-Nota: estos tests SÍ ejecutan las herramientas reales contra DuckDB
-(no se mockean las tools), porque son deterministas y rápidas; lo que
-se mockea es únicamente el LLM, que es la fuente de no determinismo y
-de dependencia de un servicio externo.
+Nota: los tests marcados con `requires_db` SÍ ejecutan las
+herramientas reales contra DuckDB (no se mockean las tools), porque
+son deterministas y rápidas; lo que se mockea es únicamente el LLM.
+Los tests de `_derive_delay_prediction` no tocan la base de datos ni
+el LLM, por eso no llevan ese marcador.
 """
 
 from __future__ import annotations
@@ -23,8 +26,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
-from agents.analytical_agent import AnalyticalOutput, analytical_agent
-from graph.state import SGIDAState
+from agents.analytical_agent import _derive_delay_prediction, analytical_agent
+from config.settings import Settings
+from graph.state import AnalyticsResult, SGIDAState
 
 
 def _copy_state(state: dict) -> SGIDAState:
@@ -38,13 +42,13 @@ def _copy_state(state: dict) -> SGIDAState:
     return cast(SGIDAState, dict(state))
 
 
-pytestmark = pytest.mark.requires_db
-
-
-def _make_ai_message_with_tool_call(tool_name: str, tool_args: dict, call_id: str = "call_1"):
-    """Construye un AIMessage que simula que el LLM decidió llamar a una tool."""
+def _make_ai_message_with_tool_calls(calls: list[tuple[str, dict]]):
+    """Construye un AIMessage que simula que el LLM pidió una o varias tools en el mismo turno."""
     msg = AIMessage(content="")
-    msg.tool_calls = [{"name": tool_name, "args": tool_args, "id": call_id}]
+    msg.tool_calls = [
+        {"name": name, "args": args, "id": f"call_{i}"}
+        for i, (name, args) in enumerate(calls)
+    ]
     return msg
 
 
@@ -55,135 +59,200 @@ def _make_ai_message_no_tool_call(content: str = ""):
     return msg
 
 
+@pytest.mark.requires_db
 class TestAnalyticalAgentExploratoryMode:
     """Integración: consulta exploratoria de extremo a extremo, LLM mockeado."""
 
     @patch("agents.analytical_agent.get_llm")
-    def test_exploratory_query_fills_analytics_result(self, mock_get_llm, state_fresh):
-        # --- Mock de la fase ReAct (llm.bind_tools(...).invoke(...)) ---
+    def test_multiple_tools_requested_in_one_turn_are_all_assembled(self, mock_get_llm, state_fresh):
         react_llm = MagicMock()
         react_llm.invoke.side_effect = [
-            _make_ai_message_with_tool_call("get_top_delay_airports", {"limit": 5}),
+            _make_ai_message_with_tool_calls([
+                ("get_top_delay_airports", {"limit": 5}),
+                ("get_delay_by_hour", {}),
+            ]),
             _make_ai_message_no_tool_call(),
         ]
 
-        # --- Mock de la fase de síntesis (llm.with_structured_output(...).invoke(...)) ---
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            exploratory_summary={"top_delay_airports": "Chicago presenta el mayor retraso medio."},
-            narrative_summary="Chicago es el aeropuerto con mayor retraso medio histórico.",
-        )
-
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         state = _copy_state(state_fresh)
-        state["user_query"] = "¿Qué aeropuertos tienen más retrasos?"
+        state["user_query"] = "¿Qué aeropuertos y qué franjas horarias son problemáticas?"
 
         result = analytical_agent(state)
 
-        assert result["analytics_result"] is not None
-        assert "messages" in result
-        assert result["analytics_result"]["summary_stats"] == {
-            "top_delay_airports": "Chicago presenta el mayor retraso medio."
+        assert result["analytics_result"]["top_delay_airports"] is not None
+        assert result["analytics_result"]["delay_by_hour"] is not None
+        assert set(result["analytics_result"]["tools_used"]) == {
+            "get_top_delay_airports", "get_delay_by_hour",
         }
+        # Solo un turno para pedir ambas tools + un turno para confirmar que no hace falta más.
+        assert react_llm.invoke.call_count == 2
 
     @patch("agents.analytical_agent.get_llm")
     def test_exploratory_query_does_not_fill_delay_prediction(self, mock_get_llm, state_fresh):
         react_llm = MagicMock()
         react_llm.invoke.return_value = _make_ai_message_no_tool_call()
 
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            exploratory_summary={},
-            narrative_summary="Sin hallazgos relevantes.",
-        )
-
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         result = analytical_agent(_copy_state(state_fresh))
 
         assert "delay_prediction" not in result
 
-
-class TestAnalyticalAgentPredictionMode:
-    """Integración: consulta de predicción de un vuelo concreto, LLM mockeado."""
-
     @patch("agents.analytical_agent.get_llm")
-    def test_prediction_query_fills_delay_prediction(
-        self, mock_get_llm, state_fresh, sample_flight_context
-    ):
+    def test_no_second_llm_call_is_made_for_synthesis(self, mock_get_llm, state_fresh):
+        # Diseño clave de este evolutivo: el ensamblaje es determinista,
+        # no debe existir ninguna llamada a with_structured_output().
         react_llm = MagicMock()
         react_llm.invoke.side_effect = [
-            _make_ai_message_with_tool_call(
-                "predict_flight_delay",
-                {
-                    "airline": "AA", "origin": "Chicago, IL",
-                    "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
-                },
-            ),
+            _make_ai_message_with_tool_calls([("get_top_delay_routes", {"limit": 5})]),
             _make_ai_message_no_tool_call(),
         ]
 
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="prediction",
-            expected_dep_delay_min=42.0,
-            expected_arr_delay_min=48.0,
-            is_disruption=True,
-            confidence=0.7,
-            main_cause="weather",
-            narrative_summary="Se espera un retraso significativo por causas meteorológicas.",
-        )
-
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
-        state = _copy_state(state_fresh)
-        state["flight_context"] = sample_flight_context
-        state["user_query"] = "Predice el retraso del vuelo AA Chicago-Denver en marzo a las 14:00"
+        analytical_agent(_copy_state(state_fresh))
 
-        result = analytical_agent(state)
-
-        assert result["delay_prediction"]["is_disruption"] is True
-        assert result["delay_prediction"]["main_cause"] == "weather"
-        assert result["delay_prediction"]["confidence"] == 0.7
+        assert base_llm.with_structured_output.call_count == 0
 
     @patch("agents.analytical_agent.get_llm")
-    def test_prediction_with_no_disruption(self, mock_get_llm, state_fresh):
+    def test_messages_trace_is_built_deterministically_not_by_llm(self, mock_get_llm, state_fresh):
         react_llm = MagicMock()
-        react_llm.invoke.return_value = _make_ai_message_no_tool_call()
-
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="prediction",
-            expected_dep_delay_min=5.0,
-            expected_arr_delay_min=3.0,
-            is_disruption=False,
-            confidence=0.9,
-            main_cause="unknown",
-            narrative_summary="No se espera disrupción significativa.",
-        )
+        react_llm.invoke.side_effect = [
+            _make_ai_message_with_tool_calls([("get_top_delay_airlines", {"limit": 5})]),
+            _make_ai_message_no_tool_call(),
+        ]
 
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         result = analytical_agent(_copy_state(state_fresh))
 
-        assert result["delay_prediction"]["is_disruption"] is False
+        trace = result["messages"][0].content
+        assert "get_top_delay_airlines" in trace
 
 
+@pytest.mark.requires_db
+class TestAnalyticalAgentFlightSpecificMode:
+    """Integración: consulta sobre un vuelo concreto, LLM mockeado."""
+
+    @patch("agents.analytical_agent.get_llm")
+    def test_flight_context_query_invokes_historical_stats_tool(
+        self, mock_get_llm, state_fresh, sample_flight_context
+    ):
+        react_llm = MagicMock()
+        react_llm.invoke.side_effect = [
+            _make_ai_message_with_tool_calls([
+                ("get_flight_historical_stats", {
+                    "airline": "AA", "origin": "Chicago, IL",
+                    "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+                }),
+            ]),
+            _make_ai_message_no_tool_call(),
+        ]
+
+        base_llm = MagicMock()
+        base_llm.bind_tools.return_value = react_llm
+        mock_get_llm.return_value = base_llm
+
+        state = _copy_state(state_fresh)
+        state["flight_context"] = sample_flight_context
+        state["user_query"] = "Analiza el histórico del vuelo AA Chicago-Denver en marzo a las 14:00"
+
+        result = analytical_agent(state)
+
+        assert result["analytics_result"]["flight_historical_stats"] is not None
+        # sample_size puede ser 0 en el dataset real para esta combinación
+        # concreta, pero delay_prediction siempre debe derivarse (con
+        # confidence 0.0 en ese caso) porque la tool sí se invocó.
+        assert "delay_prediction" in result
+        assert result["delay_prediction"]["main_cause"] in {
+            "carrier", "weather", "nas", "security", "late_aircraft", "unknown",
+        }
+
+
+class TestDeriveDelayPrediction:
+    """
+    Tests unitarios puros (sin DB, sin LLM) de la heurística determinista
+    que deriva delay_prediction a partir de flight_historical_stats.
+    """
+
+    def test_returns_none_without_flight_historical_stats(self):
+        assert _derive_delay_prediction(AnalyticsResult()) is None
+
+    def test_returns_zeroed_prediction_when_sample_size_is_zero(self):
+        analytics_result = AnalyticsResult(flight_historical_stats={
+            "airline": "ZZ", "origin": "X", "destination": "Y", "month": 1,
+            "scheduled_dep": 100, "avg_dep_delay_min": None,
+            "avg_arr_delay_min": None, "pct_over_threshold": None,
+            "sample_size": 0, "dominant_delay_cause": "unknown",
+        })
+        prediction = _derive_delay_prediction(analytics_result)
+        assert prediction["is_disruption"] is False
+        assert prediction["confidence"] == 0.0
+        assert prediction["main_cause"] == "unknown"
+
+    def test_is_disruption_true_when_avg_arrival_delay_exceeds_threshold(self):
+        analytics_result = AnalyticsResult(flight_historical_stats={
+            "airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+            "month": 3, "scheduled_dep": 1400, "avg_dep_delay_min": 40.0,
+            "avg_arr_delay_min": Settings.DELAY_THRESHOLD_MINUTES + 30.0,
+            "pct_over_threshold": 70.0, "sample_size": 250,
+            "dominant_delay_cause": "weather",
+        })
+        prediction = _derive_delay_prediction(analytics_result)
+        assert prediction["is_disruption"] is True
+        assert prediction["main_cause"] == "weather"
+
+    def test_is_disruption_false_when_avg_arrival_delay_below_threshold(self):
+        analytics_result = AnalyticsResult(flight_historical_stats={
+            "airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+            "month": 3, "scheduled_dep": 1400, "avg_dep_delay_min": 2.0,
+            "avg_arr_delay_min": max(Settings.DELAY_THRESHOLD_MINUTES - 10.0, 0.0),
+            "pct_over_threshold": 5.0, "sample_size": 250,
+            "dominant_delay_cause": "unknown",
+        })
+        prediction = _derive_delay_prediction(analytics_result)
+        assert prediction["is_disruption"] is False
+
+    def test_confidence_increases_with_sample_size(self):
+        def _confidence_for(sample_size: int) -> float:
+            analytics_result = AnalyticsResult(flight_historical_stats={
+                "airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+                "month": 3, "scheduled_dep": 1400, "avg_dep_delay_min": 10.0,
+                "avg_arr_delay_min": 10.0, "pct_over_threshold": 20.0,
+                "sample_size": sample_size, "dominant_delay_cause": "carrier",
+            })
+            return _derive_delay_prediction(analytics_result)["confidence"]
+
+        confidence_low = _confidence_for(10)
+        confidence_mid = _confidence_for(100)
+        confidence_high = _confidence_for(500)
+
+        assert confidence_low < confidence_mid < confidence_high
+        assert confidence_low <= 0.5
+        assert confidence_high >= 0.8
+
+    def test_main_cause_is_taken_verbatim_from_dominant_delay_cause(self):
+        analytics_result = AnalyticsResult(flight_historical_stats={
+            "airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+            "month": 3, "scheduled_dep": 1400, "avg_dep_delay_min": 10.0,
+            "avg_arr_delay_min": 10.0, "pct_over_threshold": 20.0,
+            "sample_size": 50, "dominant_delay_cause": "nas",
+        })
+        prediction = _derive_delay_prediction(analytics_result)
+        assert prediction["main_cause"] == "nas"
+
+
+@pytest.mark.requires_db
 class TestAnalyticalAgentReactLoopBehavior:
     """Integración: comportamiento del bucle ReAct ante distintos escenarios del LLM."""
 
@@ -192,15 +261,8 @@ class TestAnalyticalAgentReactLoopBehavior:
         react_llm = MagicMock()
         react_llm.invoke.return_value = _make_ai_message_no_tool_call()
 
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            narrative_summary="Sin datos.",
-        )
-
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         analytical_agent(_copy_state(state_fresh))
@@ -209,53 +271,57 @@ class TestAnalyticalAgentReactLoopBehavior:
         assert react_llm.invoke.call_count == 1
 
     @patch("agents.analytical_agent.get_llm")
-    def test_respects_max_tool_calls_limit(self, mock_get_llm, state_fresh):
+    def test_respects_max_react_turns_limit(self, mock_get_llm, state_fresh):
         # El LLM "insiste" en pedir tools indefinidamente; el bucle debe
-        # detenerse tras _MAX_TOOL_CALLS iteraciones (5), no continuar para siempre.
+        # detenerse tras _MAX_REACT_TURNS turnos (3), no continuar para siempre.
         react_llm = MagicMock()
-        react_llm.invoke.return_value = _make_ai_message_with_tool_call(
-            "get_delay_by_month", {}
-        )
-
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            narrative_summary="Resultado forzado tras agotar el límite.",
-        )
+        react_llm.invoke.return_value = _make_ai_message_with_tool_calls([
+            ("get_delay_by_month", {}),
+        ])
 
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         result = analytical_agent(_copy_state(state_fresh))
 
-        assert react_llm.invoke.call_count == 5  # _MAX_TOOL_CALLS
-        assert "error" not in result  # debe sintetizar igualmente, no fallar
+        assert react_llm.invoke.call_count == 3  # _MAX_REACT_TURNS
+        assert "error" not in result  # debe ensamblar igualmente, no fallar
 
     @patch("agents.analytical_agent.get_llm")
     def test_unknown_tool_name_does_not_crash_the_agent(self, mock_get_llm, state_fresh):
         react_llm = MagicMock()
         react_llm.invoke.side_effect = [
-            _make_ai_message_with_tool_call("herramienta_inexistente", {}),
+            _make_ai_message_with_tool_calls([("herramienta_inexistente", {})]),
             _make_ai_message_no_tool_call(),
         ]
 
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            narrative_summary="Se gestionó el error de herramienta correctamente.",
-        )
-
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
         result = analytical_agent(_copy_state(state_fresh))
 
         assert "error" not in result
         assert result["analytics_result"] is not None
+        # La tool desconocida no debe rellenar ningún campo real.
+        assert "herramienta_inexistente" not in result["analytics_result"]
+
+
+class TestAnalyticalAgentDegradedMode:
+    """Modo degradado: Ollama no disponible."""
+
+    @patch("agents.analytical_agent.Settings.ollama_available", return_value=False)
+    def test_degraded_mode_returns_typed_empty_result_without_calling_llm(
+        self, mock_ollama_available, state_fresh
+    ):
+        with patch("agents.analytical_agent.get_llm") as mock_get_llm:
+            result = analytical_agent(_copy_state(state_fresh))
+
+            mock_get_llm.assert_not_called()
+
+        assert result["analytics_result"]["tools_used"] == []
+        assert "delay_prediction" not in result
 
 
 class TestAnalyticalAgentErrorHandling:
@@ -271,18 +337,25 @@ class TestAnalyticalAgentErrorHandling:
         assert "analytical_agent" in result["error"]
 
     @patch("agents.analytical_agent.get_llm")
-    def test_agent_does_not_raise_on_synthesis_failure(self, mock_get_llm, state_fresh):
+    def test_malformed_tool_json_is_skipped_without_crashing(self, mock_get_llm, state_fresh):
+        # Simula una tool que devuelve texto no-JSON (p.ej. un error de
+        # ejecución capturado como string): el ensamblaje determinista
+        # debe ignorarlo sin lanzar excepción.
         react_llm = MagicMock()
-        react_llm.invoke.return_value = _make_ai_message_no_tool_call()
+        react_llm.invoke.side_effect = [
+            _make_ai_message_with_tool_calls([("get_top_delay_airports", {"limit": -1})]),
+            _make_ai_message_no_tool_call(),
+        ]
 
-        structured_llm = MagicMock()
-        structured_llm.invoke.side_effect = ValueError("Esquema inválido devuelto por el LLM")
+        broken_tool = MagicMock()
+        broken_tool.invoke.side_effect = Exception("boom")
 
         base_llm = MagicMock()
         base_llm.bind_tools.return_value = react_llm
-        base_llm.with_structured_output.return_value = structured_llm
         mock_get_llm.return_value = base_llm
 
-        # No debe lanzar; debe devolver un dict con 'error'.
-        result = analytical_agent(_copy_state(state_fresh))
-        assert "error" in result
+        with patch.dict("agents.analytical_agent._TOOLS_BY_NAME", {"get_top_delay_airports": broken_tool}):
+            result = analytical_agent(_copy_state(state_fresh))
+
+        assert "error" not in result
+        assert result["analytics_result"] is not None

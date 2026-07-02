@@ -174,20 +174,11 @@ class TestFullGraphEndToEnd:
         supervisor_base.with_structured_output.return_value = supervisor_structured
         mock_supervisor_llm.return_value = supervisor_base
 
-        # --- Agente analítico: sin tool calls, síntesis exploratoria directa ---
-        from agents.analytical_agent import AnalyticalOutput
-
+        # --- Agente analítico: sin tool calls, ensamblaje determinista directo ---
         analytical_react = MagicMock()
         analytical_react.invoke.return_value = _make_ai_message_no_tool_call()
-        analytical_structured = MagicMock()
-        analytical_structured.invoke.return_value = AnalyticalOutput(
-            response_mode="exploratory",
-            exploratory_summary={"insight": "Chicago tiene el mayor retraso medio."},
-            narrative_summary="Chicago presenta el mayor retraso medio histórico.",
-        )
         analytical_base = MagicMock()
         analytical_base.bind_tools.return_value = analytical_react
-        analytical_base.with_structured_output.return_value = analytical_structured
         mock_analytical_llm.return_value = analytical_base
 
         # --- Agente de comunicación: redacta la respuesta final ---
@@ -218,8 +209,6 @@ class TestFullGraphEndToEnd:
         # El supervisor siempre "decide" volver a analytical_agent, simulando
         # una decisión defectuosa persistente del LLM. El límite de
         # iteraciones (vía safe_next_node) debe forzar la terminación.
-        from agents.analytical_agent import AnalyticalOutput
-
         supervisor_structured = MagicMock()
         supervisor_structured.invoke.return_value = RoutingDecision(
             next_node="analytical_agent", rationale="Decisión repetida simulada."
@@ -234,13 +223,8 @@ class TestFullGraphEndToEnd:
 
             analytical_react = MagicMock()
             analytical_react.invoke.return_value = _make_ai_message_no_tool_call()
-            analytical_structured = MagicMock()
-            analytical_structured.invoke.return_value = AnalyticalOutput(
-                response_mode="exploratory", narrative_summary="Resultado parcial.",
-            )
             analytical_base = MagicMock()
             analytical_base.bind_tools.return_value = analytical_react
-            analytical_base.with_structured_output.return_value = analytical_structured
             mock_analytical_llm.return_value = analytical_base
 
             communication_llm = MagicMock()
