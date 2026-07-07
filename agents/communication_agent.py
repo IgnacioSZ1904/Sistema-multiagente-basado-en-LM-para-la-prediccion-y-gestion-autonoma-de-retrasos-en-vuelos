@@ -5,31 +5,55 @@ Agente de Comunicación de SGIDA.
 
 Responsabilidad: traducir los resultados de los agentes analítico y de
 disrupciones (ya presentes en el estado) a una respuesta en lenguaje
-natural para el operador, y registrar notificaciones simuladas cuando
-la severidad de una disrupción lo justifique.
+natural para el operador (`final_response`), y redactar borradores de
+notificación para operador y/o pasajeros afectados (`draft_notifications`)
+cuando corresponda. Los borradores NUNCA se envían automáticamente —
+el envío (simulado) es una acción explícita del operador desde el
+frontend, no una decisión del LLM.
 
-Patrón distinto a los otros dos agentes (ver docstring de
-prompts/communication_prompt.py): no hay fase de exploración de datos
-propia, así que se usa un único bucle ReAct acotado (máximo 1-2 llamadas
-a `send_passenger_notification`) sin fase de síntesis estructurada
-posterior — la salida estructurada AQUÍ es simplemente el texto final,
-que no necesita Pydantic porque `final_response` es un str.
+Diseño (decisión documentada en la memoria del TFG):
+-------------------------------------------------------------------
+Redactar texto no requiere ninguna tool, así que ya no hay bucle de
+tool-calling: una única llamada `with_structured_output` produce tanto
+`final_response` como `draft_notifications` a partir del mismo bloque
+de contexto JSON. Mismo espíritu de simplificación ya aplicado a
+`analytical_agent` y `disruption_agent` (menos llamadas LLM = más
+rápido y fiable).
 """
 
 from __future__ import annotations
 
 import json
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from config.settings import Settings, get_llm
 from graph.state import SGIDAState
 from prompts.communication_prompt import COMMUNICATION_SYSTEM_PROMPT
-from tools.communication_tools import COMMUNICATION_TOOLS
 
-_MAX_TOOL_CALLS = 2
 
-_TOOLS_BY_NAME = {t.name: t for t in COMMUNICATION_TOOLS}
+# ---------------------------------------------------------------------------
+# Esquema de salida estructurada (única llamada LLM)
+# ---------------------------------------------------------------------------
+
+class NotificationDraftModel(BaseModel):
+    """Borrador de notificación — ver graph.state.NotificationDraft."""
+
+    recipient_type: str = Field(description='"operator" | "passenger" | "ground_staff"')
+    channel: str = Field(description='"email" | "sms" | "push" | "operator_dashboard"')
+    message: str = Field(description="Texto completo del borrador, ya redactado.")
+    flight_reference: str = Field(default="", description="Identificador del vuelo, si aplica.")
+
+
+class CommunicationOutput(BaseModel):
+    """Salida estructurada del agente de comunicación."""
+
+    final_response: str = Field(description="Texto final en lenguaje natural para el operador.")
+    draft_notifications: list[NotificationDraftModel] = Field(
+        default_factory=list,
+        description="Borradores de notificación (operador y/o pasajero). Vacío si no aplica.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -67,10 +91,8 @@ def communication_agent(state: SGIDAState) -> dict:
     Nodo LangGraph del agente de comunicación.
 
     Lee los resultados disponibles en el estado (analytics_result,
-    delay_prediction, disruption_proposal, error) y genera una respuesta
-    final en lenguaje natural. Si la propuesta de disrupción es de
-    severidad alta o crítica, registra una notificación simulada antes
-    de devolver la respuesta.
+    delay_prediction, disruption_proposal, error) y hace una única
+    llamada LLM que produce `final_response` y `draft_notifications`.
 
     A diferencia de los otros agentes, un fallo aquí no debe dejar al
     operador sin respuesta: si algo falla, se devuelve un mensaje de
@@ -87,52 +109,28 @@ def communication_agent(state: SGIDAState) -> dict:
         final_text = "Sistema en modo degradado: Ollama no está disponible. Revisa la configuración del modelo local o copia .env.example a .env antes de lanzar consultas complejas."
         return {
             "final_response": final_text,
+            "draft_notifications": [],
             "messages": [AIMessage(content=final_text)],
         }
 
-    messages: list = [
-        SystemMessage(content=COMMUNICATION_SYSTEM_PROMPT),
-        HumanMessage(content=_build_context_block(state)),
-    ]
-
     final_text: str | None = None
+    draft_notifications: list[dict] = []
 
     try:
-        llm_with_tools = get_llm().bind_tools(COMMUNICATION_TOOLS)
+        structured_llm = get_llm().with_structured_output(CommunicationOutput)
 
-        for _ in range(_MAX_TOOL_CALLS):
-            response = llm_with_tools.invoke(messages)
-            messages.append(response)
+        result = structured_llm.invoke([
+            SystemMessage(content=COMMUNICATION_SYSTEM_PROMPT),
+            HumanMessage(content=_build_context_block(state)),
+        ])
 
-            if not response.tool_calls:
-                final_text = response.content if isinstance(response.content, str) else str(response.content)
-                break
+        if not isinstance(result, CommunicationOutput):
+            model_dump_fn = getattr(result, "model_dump", None)
+            result = model_dump_fn() if callable(model_dump_fn) else dict(result)
+            result = CommunicationOutput.model_validate(result)
 
-            for tool_call in response.tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                tool_fn = _TOOLS_BY_NAME.get(tool_name)
-
-                if tool_fn is None:
-                    result_content = f"Error: herramienta '{tool_name}' no existe."
-                else:
-                    try:
-                        result_content = tool_fn.invoke(tool_args)
-                    except Exception as exc:  # noqa: BLE001
-                        result_content = f"Error ejecutando '{tool_name}': {exc}"
-
-                messages.append(
-                    ToolMessage(content=str(result_content), tool_call_id=tool_call["id"])
-                )
-
-        if final_text is None:
-            # Se agotaron los intentos sin respuesta final en texto: forzamos
-            # una última llamada sin herramientas para garantizar una respuesta.
-            plain_llm = get_llm()
-            forced = plain_llm.invoke(messages + [
-                HumanMessage(content="Responde ahora con el texto final para el operador, sin usar más herramientas.")
-            ])
-            final_text = forced.content if isinstance(forced.content, str) else str(forced.content)
+        final_text = result.final_response
+        draft_notifications = [draft.model_dump() for draft in result.draft_notifications]
 
     except Exception as exc:  # noqa: BLE001
         if Settings.DEBUG_MODE:
@@ -142,8 +140,10 @@ def communication_agent(state: SGIDAState) -> dict:
             "problema interno. Por favor, reformula tu consulta o inténtalo "
             "de nuevo en unos momentos."
         )
+        draft_notifications = []
 
     return {
         "final_response": final_text,
+        "draft_notifications": draft_notifications,
         "messages": [AIMessage(content=final_text)],
     }

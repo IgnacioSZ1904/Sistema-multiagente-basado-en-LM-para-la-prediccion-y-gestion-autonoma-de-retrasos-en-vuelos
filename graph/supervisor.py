@@ -5,59 +5,37 @@ Agente orquestador (supervisor) y ensamblaje del StateGraph de SGIDA.
 
 El supervisor es un nodo más del grafo, igual que los agentes
 especializados, pero con una responsabilidad distinta: no produce
-resultados de dominio, decide el routing. Usa salida estructurada
-(Pydantic con un Literal) en lugar de texto libre, por la misma razón
-que el resto del sistema: con Ollama, forzar el esquema de salida es
-más fiable que parsear texto.
+resultados de dominio, decide el routing.
 
-La decisión final de routing pasa SIEMPRE por `safe_next_node()`
-(graph/router.py) antes de devolverse, como salvaguarda determinista.
+Diseño 100% determinista (decisión documentada en la memoria del TFG,
+evolutivo `revision-supervisor`): el supervisor solía consultar un LLM
+para decidir el primer salto de cada consulta. Al auditar el sistema
+se comprobó que esa decisión es matemáticamente redundante: en la
+primera iteración, `initial_state()` garantiza que `analytics_result`
+y `delay_prediction` están vacíos, así que la única regla de routing
+que puede aplicar es "ir a `analytical_agent`" — exactamente la misma
+que ya decide `graph/router.py::safe_next_node` de forma determinista.
+El LLM nunca podía decidir algo distinto; solo añadía una llamada
+completa de latencia y un punto de fallo más. Se elimina, siguiendo el
+mismo patrón ya aplicado a los tres agentes especializados (sustituir
+juicio de LLM por código determinista cuando el LLM no aporta valor
+real).
+
+`graph/router.py::safe_next_node` es ahora la ÚNICA fuente de verdad
+del routing.
 """
 
 from __future__ import annotations
 
-from typing import Literal, cast
+from typing import cast
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field
 from langgraph.graph import END, StateGraph
 
 from agents.analytical_agent import analytical_agent
 from agents.communication_agent import communication_agent
 from agents.disruption_agent import disruption_agent
-from config.settings import Settings, get_llm
 from graph.router import END_NODE, safe_next_node
 from graph.state import SGIDAState, initial_state
-from prompts.supervisor_prompt import SUPERVISOR_SYSTEM_PROMPT
-
-
-# ---------------------------------------------------------------------------
-# Esquema de salida estructurada del supervisor
-# ---------------------------------------------------------------------------
-
-class RoutingDecision(BaseModel):
-    """Decisión de enrutamiento del supervisor."""
-
-    next_node: Literal[
-        "analytical_agent", "disruption_agent", "communication_agent", "END"
-    ] = Field(description="Nombre del siguiente nodo al que debe saltar el grafo.")
-    rationale: str = Field(
-        description="Justificacion breve (1 frase) de por que se elige este nodo."
-    )
-
-
-def _build_state_summary(state: SGIDAState) -> str:
-    """Resume el estado actual en texto plano para que el LLM decida el routing."""
-    return (
-        f"user_query: {state['user_query']}\n"
-        f"flight_context: {state.get('flight_context')}\n"
-        f"analytics_result presente: {state.get('analytics_result') is not None}\n"
-        f"delay_prediction: {state.get('delay_prediction')}\n"
-        f"disruption_proposal presente: {state.get('disruption_proposal') is not None}\n"
-        f"final_response presente: {state.get('final_response') is not None}\n"
-        f"error: {state.get('error')}\n"
-        f"iteracion actual: {state['iteration']} / max. {Settings.GRAPH_MAX_ITERATIONS}"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -66,31 +44,14 @@ def _build_state_summary(state: SGIDAState) -> str:
 
 def supervisor(state: SGIDAState) -> dict:
     """
-    Nodo LangGraph del supervisor. Prioriza routing determinista para
-    evitar bloqueos innecesarios y solo usa LLM si Ollama está disponible.
+    Nodo LangGraph del supervisor. Enteramente determinista: delega en
+    `safe_next_node`, que ya aplica las reglas de negocio (qué agente
+    sigue según lo que haya en el estado) y las salvaguardas (límite de
+    iteraciones, nombres de nodo inválidos, no repetir un agente ya
+    completado).
     """
-    llm_choice = safe_next_node(state, "")
-
-    if state["iteration"] == 0:
-        try:
-            structured_llm = get_llm().with_structured_output(RoutingDecision)
-            decision_raw = structured_llm.invoke([
-                SystemMessage(content=SUPERVISOR_SYSTEM_PROMPT),
-                HumanMessage(content=_build_state_summary(state)),
-            ])
-            decision = RoutingDecision.model_validate(decision_raw)
-            llm_choice = safe_next_node(state, decision.next_node)
-            if Settings.DEBUG_MODE:
-                print(f"[supervisor] LLM propone: {decision.next_node} - {decision.rationale}")
-        except Exception as exc:  # noqa: BLE001
-            if Settings.DEBUG_MODE:
-                print(f"[supervisor] Error en decision de routing: {exc}")
-            llm_choice = "communication_agent"
-
-    next_node = safe_next_node(state, llm_choice)
-
     return {
-        "next_agent": next_node,
+        "next_agent": safe_next_node(state, ""),
         "iteration": state["iteration"] + 1,
     }
 
@@ -160,7 +121,7 @@ def build_graph():
 # Punto de entrada de conveniencia
 # ---------------------------------------------------------------------------
 
-def run_query(user_query: str) -> SGIDAState:
+def run_query(user_query: str, optimization_criterion: str | None = None) -> SGIDAState:
     """
     Ejecuta una consulta completa de extremo a extremo a traves del grafo.
 
@@ -168,6 +129,10 @@ def run_query(user_query: str) -> SGIDAState:
     ----------
     user_query : str
         Consulta del operador en lenguaje natural.
+    optimization_criterion : str | None
+        Criterio de optimización elegido por el operador ("min_passengers" |
+        "min_cost") para el agente de disrupciones. Si se omite, se usa
+        Settings.DEFAULT_OPTIMIZATION_CRITERION.
 
     Returns
     -------
@@ -175,4 +140,4 @@ def run_query(user_query: str) -> SGIDAState:
         Estado final tras la ejecucion del grafo (incluye final_response).
     """
     app = build_graph()
-    return cast(SGIDAState, app.invoke(initial_state(user_query)))
+    return cast(SGIDAState, app.invoke(initial_state(user_query, optimization_criterion)))

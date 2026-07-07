@@ -11,4 +11,4 @@ service = QueryService()
 
 @router.post("/query", response_model=QueryResponse)
 def execute_query(payload: QueryRequest) -> QueryResponse:
-    return service.execute(payload.query)
+    return service.execute(payload.query, payload.optimization_criterion)

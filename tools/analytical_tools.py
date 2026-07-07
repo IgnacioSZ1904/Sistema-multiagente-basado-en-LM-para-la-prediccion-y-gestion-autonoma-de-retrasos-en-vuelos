@@ -325,7 +325,7 @@ def get_flight_historical_stats(
 @tool
 def get_cascade_risk_context(
     origin: str,
-    flight_date: str,
+    month: int,
     dep_hour: int,
     delay_minutes: float,
 ) -> str:
@@ -339,7 +339,8 @@ def get_cascade_risk_context(
 
     Args:
         origin:        Ciudad del aeropuerto afectado (ej. "Chicago, IL").
-        flight_date:   Fecha en formato YYYY-MM-DD (ej. "2018-03-10").
+        month:         Mes del vuelo de referencia (1-12), para filtrar
+                       histórico de la misma temporada.
         dep_hour:      Hora de salida del vuelo de referencia (0-23).
         delay_minutes: Minutos de retraso del vuelo de referencia.
 
@@ -347,12 +348,6 @@ def get_cascade_risk_context(
         JSON con lista de vuelos: destination, airline,
         scheduled_dep, avg_late_aircraft_delay_min, total_flights.
     """
-    # Extraemos mes para filtrar histórico similar
-    try:
-        month = int(flight_date.split("-")[1])
-    except (IndexError, ValueError):
-        month = 1
-
     window_start = dep_hour
     window_end = min(dep_hour + 2, 23)
 

@@ -26,7 +26,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from langchain_core.messages import AIMessage
 
-from agents.analytical_agent import _derive_delay_prediction, analytical_agent
+from agents.analytical_agent import _derive_delay_prediction, _derive_flight_context, analytical_agent
 from config.settings import Settings
 from graph.state import AnalyticsResult, SGIDAState
 
@@ -177,6 +177,128 @@ class TestAnalyticalAgentFlightSpecificMode:
         assert result["delay_prediction"]["main_cause"] in {
             "carrier", "weather", "nas", "security", "late_aircraft", "unknown",
         }
+
+    @patch("agents.analytical_agent.get_llm")
+    def test_flight_context_is_derived_without_being_pre_supplied(self, mock_get_llm, state_fresh):
+        # Caso real de producción (ver revision-supervisor): nadie
+        # rellena `flight_context` de antemano — el operador solo
+        # escribe texto libre. El agente debe derivarlo él mismo de los
+        # argumentos con los que el LLM invocó get_flight_historical_stats.
+        react_llm = MagicMock()
+        react_llm.invoke.side_effect = [
+            _make_ai_message_with_tool_calls([
+                ("get_flight_historical_stats", {
+                    "airline": "AA", "origin": "Chicago, IL",
+                    "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+                }),
+            ]),
+            _make_ai_message_no_tool_call(),
+        ]
+
+        base_llm = MagicMock()
+        base_llm.bind_tools.return_value = react_llm
+        mock_get_llm.return_value = base_llm
+
+        state = _copy_state(state_fresh)
+        assert state["flight_context"] is None
+        state["user_query"] = "Predice el retraso del vuelo AA en la ruta de Chicago, IL a Denver, CO en marzo a las 14:00"
+
+        result = analytical_agent(state)
+
+        assert result["flight_context"] == {
+            "airline": "AA", "origin": "Chicago, IL",
+            "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+        }
+
+    @patch("agents.analytical_agent.get_llm")
+    def test_cascade_risk_context_is_invoked_deterministically_even_if_llm_did_not_request_it(
+        self, mock_get_llm, state_fresh, sample_flight_context
+    ):
+        # El LLM solo pide get_flight_historical_stats; nunca solicita
+        # get_cascade_risk_context. Aun así, debe acabar presente en
+        # analytics_result porque es un requisito de sistema, no una
+        # decisión discrecional del LLM (ver refactor-agente-disrupcion).
+        react_llm = MagicMock()
+        react_llm.invoke.side_effect = [
+            _make_ai_message_with_tool_calls([
+                ("get_flight_historical_stats", {
+                    "airline": "AA", "origin": "Chicago, IL",
+                    "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+                }),
+            ]),
+            _make_ai_message_no_tool_call(),
+        ]
+
+        base_llm = MagicMock()
+        base_llm.bind_tools.return_value = react_llm
+        mock_get_llm.return_value = base_llm
+
+        state = _copy_state(state_fresh)
+        state["flight_context"] = sample_flight_context
+        state["user_query"] = "Analiza el histórico del vuelo AA Chicago-Denver en marzo a las 14:00"
+
+        result = analytical_agent(state)
+
+        assert "cascade_risk_context" in result["analytics_result"]
+        assert "get_cascade_risk_context" in result["analytics_result"]["tools_used"]
+
+    @patch("agents.analytical_agent.get_llm")
+    def test_cascade_risk_context_not_forced_without_flight_context(self, mock_get_llm, state_fresh):
+        react_llm = MagicMock()
+        react_llm.invoke.return_value = _make_ai_message_no_tool_call()
+
+        base_llm = MagicMock()
+        base_llm.bind_tools.return_value = react_llm
+        mock_get_llm.return_value = base_llm
+
+        result = analytical_agent(_copy_state(state_fresh))
+
+        assert "cascade_risk_context" not in result["analytics_result"]
+
+
+class TestDeriveFlightContext:
+    """
+    Tests unitarios puros (sin DB, sin LLM) de la derivación determinista
+    de FlightContext a partir de los argumentos de tool ya usados.
+    """
+
+    def test_returns_none_without_flight_historical_stats_call(self):
+        assert _derive_flight_context([]) is None
+
+    def test_returns_none_when_only_exploratory_tools_were_called(self):
+        tool_results = [("get_top_delay_airports", {"limit": 5}, "[]")]
+        assert _derive_flight_context(tool_results) is None
+
+    def test_derives_flight_context_from_tool_args(self):
+        tool_results = [
+            ("get_flight_historical_stats", {
+                "airline": "AA", "origin": "Chicago, IL",
+                "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+            }, "{}"),
+        ]
+
+        flight_context = _derive_flight_context(tool_results)
+
+        assert flight_context == {
+            "airline": "AA", "origin": "Chicago, IL",
+            "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+        }
+
+    def test_last_call_wins_when_invoked_more_than_once(self):
+        tool_results = [
+            ("get_flight_historical_stats", {
+                "airline": "AA", "origin": "Chicago, IL",
+                "destination": "Denver, CO", "month": 3, "scheduled_dep": 1400,
+            }, "{}"),
+            ("get_flight_historical_stats", {
+                "airline": "UA", "origin": "New York, NY",
+                "destination": "Los Angeles, CA", "month": 6, "scheduled_dep": 900,
+            }, "{}"),
+        ]
+
+        flight_context = _derive_flight_context(tool_results)
+
+        assert flight_context["airline"] == "UA"
 
 
 class TestDeriveDelayPrediction:

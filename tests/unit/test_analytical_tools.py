@@ -240,7 +240,7 @@ class TestGetCascadeRiskContext:
     def test_returns_valid_json_list(self):
         result = get_cascade_risk_context.invoke({
             "origin": "Chicago, IL",
-            "flight_date": "2018-03-10",
+            "month": 3,
             "dep_hour": 14,
             "delay_minutes": 45.0,
         })
@@ -250,7 +250,7 @@ class TestGetCascadeRiskContext:
     def test_each_row_has_expected_fields(self):
         result = get_cascade_risk_context.invoke({
             "origin": "Chicago, IL",
-            "flight_date": "2018-03-10",
+            "month": 3,
             "dep_hour": 14,
             "delay_minutes": 45.0,
         })

@@ -15,7 +15,7 @@ console = Console()
 
 _BANNER = """\
 [bold cyan]SGIDA[/bold cyan] — Sistema de Gestión Integral de Disrupciones Aéreas
-[dim]Modelo local: {model}  |  Umbral de disrupción: {threshold} min[/dim]
+[dim]Modelo local: {model}  |  Umbral de disrupción: {threshold} min  |  Criterio de optimización: {criterion}[/dim]
 
 Escribe tu consulta en lenguaje natural. Ejemplos:
   • \"¿Qué aeropuertos tienen más retrasos?\"
@@ -32,6 +32,7 @@ def _print_banner() -> None:
             _BANNER.format(
                 model=Settings.OLLAMA_MODEL,
                 threshold=Settings.DELAY_THRESHOLD_MINUTES,
+                criterion=Settings.DEFAULT_OPTIMIZATION_CRITERION,
             ),
             border_style="cyan",
         )

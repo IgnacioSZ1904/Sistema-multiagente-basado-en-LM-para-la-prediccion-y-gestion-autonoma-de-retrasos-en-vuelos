@@ -3,15 +3,19 @@ tools/communication_tools.py
 =============================
 Herramientas LangChain del agente de comunicación.
 
-El agente de comunicación redacta los textos (informes, notificaciones)
-directamente con el LLM a partir de su prompt — no requiere una @tool
-para "escribir", solo para su propia razón de ser como agente.
+El agente de comunicación (agents/communication_agent.py) redacta los
+textos (informes, borradores de notificación) directamente con el LLM
+a partir de su prompt — no invoca estas tools, solo REDACTA contenido.
 
-Lo que SÍ necesita como herramienta es el envío/registro de la
-notificación una vez redactada. En este TFG no se integra con un
-proveedor real de email/SMS (fuera de alcance), así que el envío se
-SIMULA mediante un log estructurado a fichero, dejando trazabilidad
-de qué se habría comunicado, a quién y cuándo.
+Estas tools se invocan desde las rutas de la API
+(backend/app/api/routes/notifications.py, dashboard.py), como acción
+explícita del operador (enviar un borrador) o para leer el historial
+del panel de estado — nunca de forma automática por el LLM.
+
+En este TFG no se integra con un proveedor real de email/SMS (fuera de
+alcance), así que el envío se SIMULA mediante un log estructurado a
+fichero, dejando trazabilidad de qué se habría comunicado, a quién y
+cuándo.
 """
 
 from __future__ import annotations

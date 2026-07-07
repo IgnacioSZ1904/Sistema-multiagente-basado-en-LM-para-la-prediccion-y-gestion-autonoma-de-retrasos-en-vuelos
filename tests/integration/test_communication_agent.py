@@ -3,13 +3,11 @@ tests/integration/test_communication_agent.py
 ==================================================
 Tests de integración del agente de comunicación CON EL LLM MOCKEADO.
 
-A diferencia de los otros dos agentes, communication_agent no tiene
-fase de síntesis estructurada separada (su salida es texto plano), así
-que solo se mockea bind_tools(...).invoke(...) y, en el caso del
-fallback, una llamada adicional sin tools.
-
-No requiere analytical_db.duckdb (usa el log de notificaciones propio
-en un directorio temporal aislado), así que NO se marca con requires_db.
+Ya no hay bucle de tool-calling: una única llamada `with_structured_output`
+produce `final_response` y `draft_notifications`. El agente nunca
+invoca `send_passenger_notification` por sí mismo (eso ahora es una
+ruta de la API, ver tests/integration/test_api_routes.py) — por eso
+estos tests no necesitan aislar ningún fichero de log.
 """
 
 from __future__ import annotations
@@ -17,10 +15,7 @@ from __future__ import annotations
 from typing import cast
 from unittest.mock import MagicMock, patch
 
-import pytest
-from langchain_core.messages import AIMessage
-
-from agents.communication_agent import communication_agent
+from agents.communication_agent import CommunicationOutput, communication_agent
 from graph.state import DisruptionProposal, SGIDAState
 
 
@@ -29,136 +24,130 @@ def _copy_state(state: dict) -> SGIDAState:
     return cast(SGIDAState, dict(state))
 
 
-def _make_ai_message_with_tool_call(tool_name: str, tool_args: dict, call_id: str = "call_1"):
-    msg = AIMessage(content="")
-    msg.tool_calls = [{"name": tool_name, "args": tool_args, "id": call_id}]
-    return msg
-
-
-def _make_ai_message_no_tool_call(content: str):
-    msg = AIMessage(content=content)
-    msg.tool_calls = []
-    return msg
-
-
-@pytest.fixture(autouse=True)
-def _isolated_log_file(tmp_path, monkeypatch):
-    """Redirige el log de notificaciones a un fichero temporal por test."""
-    import tools.communication_tools as mod
-
-    temp_log_dir = tmp_path / "notifications_log"
-    temp_log_file = temp_log_dir / "notifications.jsonl"
-
-    monkeypatch.setattr(mod, "_LOG_DIR", temp_log_dir)
-    monkeypatch.setattr(mod, "_LOG_FILE", temp_log_file)
-    yield temp_log_file
+def _mock_structured_llm(mock_get_llm, output: CommunicationOutput) -> MagicMock:
+    structured_llm = MagicMock()
+    structured_llm.invoke.return_value = output
+    base_llm = MagicMock()
+    base_llm.with_structured_output.return_value = structured_llm
+    mock_get_llm.return_value = base_llm
+    return base_llm
 
 
 class TestCommunicationAgentTextOnlyResponses:
-    """Integración: respuestas sin necesidad de notificar."""
+    """Integración: respuestas sin necesidad de borradores de notificación."""
 
     @patch("agents.communication_agent.get_llm")
     def test_exploratory_result_produces_final_response_text(
         self, mock_get_llm, state_with_exploratory_result
     ):
-        llm_with_tools = MagicMock()
-        llm_with_tools.invoke.return_value = _make_ai_message_no_tool_call(
-            "Chicago es el aeropuerto con mayor retraso medio histórico."
-        )
-
-        base_llm = MagicMock()
-        base_llm.bind_tools.return_value = llm_with_tools
-        mock_get_llm.return_value = base_llm
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Chicago es el aeropuerto con mayor retraso medio histórico.",
+            draft_notifications=[],
+        ))
 
         result = communication_agent(_copy_state(state_with_exploratory_result))
 
         assert result["final_response"] == "Chicago es el aeropuerto con mayor retraso medio histórico."
+        assert result["draft_notifications"] == []
         assert "messages" in result
 
     @patch("agents.communication_agent.get_llm")
-    def test_low_severity_proposal_does_not_trigger_notification(
-        self, mock_get_llm, state_with_disruption_proposal, _isolated_log_file
-    ):
-        # Aunque el fixture trae severity="high", forzamos "low" para este test.
-        state = _copy_state(state_with_disruption_proposal)
-        original_proposal = cast(DisruptionProposal, state["disruption_proposal"])
-        modified_proposal: DisruptionProposal = cast(DisruptionProposal, dict(original_proposal))
-        modified_proposal["severity"] = "low"
-        state["disruption_proposal"] = modified_proposal
+    def test_only_one_llm_call_is_made(self, mock_get_llm, state_with_exploratory_result):
+        base_llm = _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Resumen exploratorio.", draft_notifications=[],
+        ))
 
-        llm_with_tools = MagicMock()
-        llm_with_tools.invoke.return_value = _make_ai_message_no_tool_call(
-            "Retraso leve detectado; no se requiere acción inmediata."
-        )
+        communication_agent(_copy_state(state_with_exploratory_result))
 
-        base_llm = MagicMock()
-        base_llm.bind_tools.return_value = llm_with_tools
-        mock_get_llm.return_value = base_llm
-
-        communication_agent(state)
-
-        assert not _isolated_log_file.exists()
+        assert base_llm.with_structured_output.call_count == 1
+        assert base_llm.bind_tools.called is False
 
 
-class TestCommunicationAgentNotificationFlow:
-    """Integración: severidad alta/crítica debe poder registrar notificación."""
+class TestCommunicationAgentDraftNotifications:
+    """Integración: reglas de generación de borradores de notificación."""
 
     @patch("agents.communication_agent.get_llm")
-    def test_high_severity_proposal_can_trigger_notification_tool(
-        self, mock_get_llm, state_with_disruption_proposal, _isolated_log_file
-    ):
-        llm_with_tools = MagicMock()
-        llm_with_tools.invoke.side_effect = [
-            _make_ai_message_with_tool_call(
-                "send_passenger_notification",
-                {
-                    "recipient_type": "operator",
-                    "message": "Disrupción de severidad alta detectada en vuelo AA.",
-                    "flight_reference": "AA - Chicago,IL-Denver,CO",
-                },
-            ),
-            _make_ai_message_no_tool_call(
-                "Se ha detectado una disrupción de severidad alta y se ha notificado al operador."
-            ),
-        ]
+    def test_no_disruption_proposal_means_no_drafts(self, mock_get_llm, state_with_exploratory_result):
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Sin disrupciones detectadas.", draft_notifications=[],
+        ))
 
-        base_llm = MagicMock()
-        base_llm.bind_tools.return_value = llm_with_tools
-        mock_get_llm.return_value = base_llm
+        result = communication_agent(_copy_state(state_with_exploratory_result))
 
-        result = communication_agent(_copy_state(state_with_disruption_proposal))
-
-        assert _isolated_log_file.exists()
-        assert "notificado" in result["final_response"]
+        assert result["draft_notifications"] == []
 
     @patch("agents.communication_agent.get_llm")
-    def test_notification_tool_call_count_respects_max_tool_calls(
+    def test_low_severity_produces_only_operator_draft(
         self, mock_get_llm, state_with_disruption_proposal
     ):
-        llm_with_tools = MagicMock()
-        # El LLM "insiste" en llamar a la tool indefinidamente.
-        llm_with_tools.invoke.return_value = _make_ai_message_with_tool_call(
-            "send_passenger_notification",
-            {"recipient_type": "operator", "message": "Mensaje repetido."},
-        )
+        state = _copy_state(state_with_disruption_proposal)
+        proposal = cast(DisruptionProposal, dict(state["disruption_proposal"]))
+        proposal["severity"] = "low"
+        state["disruption_proposal"] = proposal
 
-        # Tras agotar _MAX_TOOL_CALLS, se hace una llamada adicional sin tools.
-        plain_llm = MagicMock()
-        plain_llm.invoke.return_value = AIMessage(content="Respuesta forzada final.")
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Retraso leve detectado.",
+            draft_notifications=[
+                {"recipient_type": "operator", "channel": "operator_dashboard",
+                 "message": "Retraso leve, sin acción urgente.", "flight_reference": "UA890"},
+            ],
+        ))
 
-        base_llm = MagicMock()
-        base_llm.bind_tools.return_value = llm_with_tools
-        mock_get_llm.return_value = base_llm
+        result = communication_agent(state)
 
-        # get_llm() se llama dos veces: una para bind_tools, otra para el fallback plano.
-        # Configuramos el mock para devolver el mismo base_llm ambas veces,
-        # y comprobamos que el propio base_llm (sin bind_tools) se usa de fallback.
-        base_llm.invoke = plain_llm.invoke
+        recipients = {draft["recipient_type"] for draft in result["draft_notifications"]}
+        assert recipients == {"operator"}
+
+    @patch("agents.communication_agent.get_llm")
+    def test_high_severity_produces_operator_and_passenger_drafts(
+        self, mock_get_llm, state_with_disruption_proposal
+    ):
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Disrupción de severidad alta detectada.",
+            draft_notifications=[
+                {"recipient_type": "operator", "channel": "operator_dashboard",
+                 "message": "Severidad alta; reasignar pasajeros a UA890.", "flight_reference": "UA890"},
+                {"recipient_type": "passenger", "channel": "email",
+                 "message": "Su vuelo sufre un retraso; le hemos reasignado a UA890.", "flight_reference": "UA890"},
+            ],
+        ))
 
         result = communication_agent(_copy_state(state_with_disruption_proposal))
 
-        assert llm_with_tools.invoke.call_count == 2  # _MAX_TOOL_CALLS del agente
-        assert result["final_response"] == "Respuesta forzada final."
+        recipients = {draft["recipient_type"] for draft in result["draft_notifications"]}
+        assert recipients == {"operator", "passenger"}
+
+    @patch("agents.communication_agent.get_llm")
+    def test_drafts_are_not_sent_only_returned_as_data(
+        self, mock_get_llm, state_with_disruption_proposal
+    ):
+        # No debe existir ninguna interacción con tools de envío: el
+        # agente solo devuelve los borradores como datos.
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="Disrupción detectada.",
+            draft_notifications=[
+                {"recipient_type": "operator", "channel": "operator_dashboard",
+                 "message": "Borrador.", "flight_reference": ""},
+            ],
+        ))
+
+        result = communication_agent(_copy_state(state_with_disruption_proposal))
+
+        assert isinstance(result["draft_notifications"], list)
+        assert isinstance(result["draft_notifications"][0], dict)
+
+
+class TestCommunicationAgentDegradedMode:
+    """Modo degradado: Ollama no disponible y sin resultados previos."""
+
+    @patch("agents.communication_agent.Settings.ollama_available", return_value=False)
+    def test_degraded_mode_without_prior_results(self, mock_ollama_available, state_fresh):
+        with patch("agents.communication_agent.get_llm") as mock_get_llm:
+            result = communication_agent(_copy_state(state_fresh))
+            mock_get_llm.assert_not_called()
+
+        assert result["draft_notifications"] == []
+        assert "Ollama no está disponible" in result["final_response"]
 
 
 class TestCommunicationAgentErrorHandling:
@@ -168,14 +157,10 @@ class TestCommunicationAgentErrorHandling:
     def test_state_with_error_produces_user_friendly_message(
         self, mock_get_llm, state_with_error
     ):
-        llm_with_tools = MagicMock()
-        llm_with_tools.invoke.return_value = _make_ai_message_no_tool_call(
-            "No se ha podido completar tu solicitud debido a un problema técnico."
-        )
-
-        base_llm = MagicMock()
-        base_llm.bind_tools.return_value = llm_with_tools
-        mock_get_llm.return_value = base_llm
+        _mock_structured_llm(mock_get_llm, CommunicationOutput(
+            final_response="No se ha podido completar tu solicitud debido a un problema técnico.",
+            draft_notifications=[],
+        ))
 
         result = communication_agent(_copy_state(state_with_error))
 
@@ -196,6 +181,7 @@ class TestCommunicationAgentErrorHandling:
 
         assert result["final_response"]
         assert isinstance(result["final_response"], str)
+        assert result["draft_notifications"] == []
 
     def test_empty_state_does_not_crash_context_builder(self, state_fresh):
         # No debe lanzar excepción solo por construir el bloque de contexto,

@@ -97,7 +97,7 @@ def sample_delay_prediction_ok() -> DelayPrediction:
 
 
 @pytest.fixture
-def sample_disruption_proposal() -> DisruptionProposal:
+def sample_disruption_proposal(sample_delay_prediction_disrupted, sample_flight_context) -> DisruptionProposal:
     """Propuesta de disrupción de ejemplo."""
     return DisruptionProposal(
         proposal_id="PROP-test0001",
@@ -107,9 +107,26 @@ def sample_disruption_proposal() -> DisruptionProposal:
             "Notificar a personal de puerta sobre posible saturación",
         ],
         affected_passengers_est=150,
-        alternative_flights=["UA890 - 16:10", "DL220 - 17:00"],
+        alternative_flights=["UA890 - 16:10"],
         reasoning="Retraso de 52 min por causa meteorológica, sin margen "
         "operativo suficiente en el aeropuerto de origen.",
+        optimization_criterion="min_passengers",
+        alternatives_considered=[
+            {
+                "airline": "UA890", "scheduled_dep": 1610, "avg_arr_delay_min": 10.0,
+                "reliability_pct": 92.0, "score": 92.0, "selected": True,
+            },
+            {
+                "airline": "DL220", "scheduled_dep": 1700, "avg_arr_delay_min": 25.0,
+                "reliability_pct": 78.0, "score": 78.0, "selected": False,
+            },
+        ],
+        estimated_operational_cost=34.5,
+        source_context={
+            "delay_prediction": sample_delay_prediction_disrupted,
+            "cascade_risk_context": [],
+            "flight_context": sample_flight_context,
+        },
     )
 
 

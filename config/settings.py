@@ -54,6 +54,12 @@ class Settings:
     # --- Dominio aéreo ---------------------------------------------------
     DELAY_THRESHOLD_MINUTES: int = int(os.getenv("DELAY_THRESHOLD_MINUTES", "15"))
 
+    # --- Criterio de optimización del agente de disrupción ---------------
+    OPTIMIZATION_CRITERIA: tuple[str, ...] = ("min_passengers", "min_cost")
+    DEFAULT_OPTIMIZATION_CRITERION: str = os.getenv(
+        "DEFAULT_OPTIMIZATION_CRITERION", "min_passengers"
+    )
+
     # --- Depuración ------------------------------------------------------
     DEBUG_MODE: bool = os.getenv("DEBUG_MODE", "false").lower() == "true"
 

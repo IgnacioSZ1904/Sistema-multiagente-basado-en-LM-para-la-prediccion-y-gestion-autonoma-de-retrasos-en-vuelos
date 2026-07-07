@@ -11,11 +11,14 @@ from __future__ import annotations
 
 from langchain_core.messages import BaseMessage
 
+from config.settings import Settings
 from graph.state import (
+    AlternativeCandidate,
     AnalyticsResult,
     DelayPrediction,
     DisruptionProposal,
     FlightContext,
+    NotificationDraft,
     SGIDAState,
     initial_state,
 )
@@ -54,7 +57,7 @@ class TestInitialState:
         expected_keys = {
             "messages", "user_query", "flight_context", "next_agent",
             "iteration", "analytics_result", "delay_prediction",
-            "disruption_proposal", "final_response", "error",
+            "disruption_proposal", "final_response", "draft_notifications", "error",
         }
         assert expected_keys.issubset(state.keys())
 
@@ -63,6 +66,30 @@ class TestInitialState:
         # la validación de "consulta no vacía" es responsabilidad de main.py.
         state = initial_state("")
         assert state["user_query"] == ""
+
+    def test_initial_state_defaults_optimization_criterion(self):
+        state = initial_state("consulta de prueba")
+        assert state["optimization_criterion"] == Settings.DEFAULT_OPTIMIZATION_CRITERION
+
+    def test_initial_state_accepts_explicit_optimization_criterion(self):
+        state = initial_state("consulta de prueba", optimization_criterion="min_cost")
+        assert state["optimization_criterion"] == "min_cost"
+
+    def test_initial_state_draft_notifications_starts_empty(self):
+        state = initial_state("consulta de prueba")
+        assert state["draft_notifications"] == []
+
+
+class TestNotificationDraft:
+    """Tests de construcción del TypedDict NotificationDraft."""
+
+    def test_notification_draft_fields(self):
+        draft = NotificationDraft(
+            recipient_type="passenger", channel="email",
+            message="Su vuelo sufre un retraso.", flight_reference="AA1234",
+        )
+        assert draft["recipient_type"] == "passenger"
+        assert draft["flight_reference"] == "AA1234"
 
 
 class TestFlightContext:
@@ -119,30 +146,70 @@ class TestDelayPrediction:
 
 
 class TestDisruptionProposal:
-    """Tests de construcción del TypedDict DisruptionProposal."""
+    """Tests de construcción del TypedDict DisruptionProposal (ampliado)."""
 
-    def test_disruption_proposal_actions_is_list(self):
-        proposal = DisruptionProposal(
+    def _base_kwargs(self, **overrides):
+        kwargs = dict(
             proposal_id="PROP-abc123",
             severity="medium",
             actions=["Acción 1", "Acción 2"],
             affected_passengers_est=80,
             alternative_flights=[],
             reasoning="Razonamiento de prueba.",
+            optimization_criterion="min_passengers",
+            alternatives_considered=[],
+            estimated_operational_cost=None,
+            source_context={},
         )
+        kwargs.update(overrides)
+        return kwargs
+
+    def test_disruption_proposal_actions_is_list(self):
+        proposal = DisruptionProposal(**self._base_kwargs(actions=["Acción 1", "Acción 2"]))
         assert isinstance(proposal["actions"], list)
         assert len(proposal["actions"]) == 2
 
     def test_disruption_proposal_allows_empty_alternatives(self):
-        proposal = DisruptionProposal(
-            proposal_id="PROP-abc124",
+        proposal = DisruptionProposal(**self._base_kwargs(
             severity="critical",
             actions=["Notificar a todos los pasajeros"],
             affected_passengers_est=200,
             alternative_flights=[],
             reasoning="No hay vuelos alternativos fiables disponibles.",
-        )
+        ))
         assert proposal["alternative_flights"] == []
+
+    def test_disruption_proposal_accepts_alternatives_considered(self):
+        candidates = [
+            {"airline": "UA890", "scheduled_dep": 1610, "avg_arr_delay_min": 10.0,
+             "reliability_pct": 92.0, "score": 92.0, "selected": True},
+        ]
+        proposal = DisruptionProposal(**self._base_kwargs(alternatives_considered=candidates))
+        assert proposal["alternatives_considered"][0]["selected"] is True
+
+    def test_disruption_proposal_optimization_criterion_field(self):
+        proposal = DisruptionProposal(**self._base_kwargs(optimization_criterion="min_cost"))
+        assert proposal["optimization_criterion"] == "min_cost"
+
+    def test_disruption_proposal_estimated_operational_cost_can_be_none(self):
+        proposal = DisruptionProposal(**self._base_kwargs(estimated_operational_cost=None))
+        assert proposal["estimated_operational_cost"] is None
+
+    def test_disruption_proposal_source_context_is_dict(self):
+        proposal = DisruptionProposal(**self._base_kwargs(source_context={"flight_context": {"airline": "AA"}}))
+        assert proposal["source_context"]["flight_context"]["airline"] == "AA"
+
+
+class TestAlternativeCandidate:
+    """Tests de construcción del TypedDict AlternativeCandidate."""
+
+    def test_alternative_candidate_fields(self):
+        candidate = AlternativeCandidate(
+            airline="AA", scheduled_dep=1400, avg_arr_delay_min=12.0,
+            reliability_pct=88.0, score=88.0, selected=True,
+        )
+        assert candidate["selected"] is True
+        assert candidate["score"] == 88.0
 
 
 class TestAnalyticsResult:

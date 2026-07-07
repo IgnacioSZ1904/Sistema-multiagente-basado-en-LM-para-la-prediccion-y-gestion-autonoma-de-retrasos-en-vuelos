@@ -49,7 +49,7 @@ from typing import Any, Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config.settings import Settings, get_llm
-from graph.state import AnalyticsResult, DelayPrediction, SGIDAState
+from graph.state import AnalyticsResult, DelayPrediction, FlightContext, SGIDAState
 from prompts.analytical_prompt import ANALYTICAL_REACT_SYSTEM_PROMPT
 from tools.analytical_tools import ANALYTICAL_TOOLS
 
@@ -77,7 +77,7 @@ _TOOL_NAME_TO_FIELD = {
 # Fase 1 — Bucle ReAct manual
 # ---------------------------------------------------------------------------
 
-def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[str, str]]:
+def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[str, dict, str]]:
     """
     Ejecuta el bucle ReAct manual: el LLM decide qué herramientas llamar,
     este código las ejecuta, hasta que el LLM no solicita más
@@ -85,10 +85,11 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
 
     Returns
     -------
-    list[tuple[str, str]]
-        Pares (nombre_de_tool, resultado_json) de cada tool invocada, en
-        el orden de ejecución. Es la entrada del ensamblaje determinista
-        de la fase 2 (ver _assemble_analytics_result).
+    list[tuple[str, dict, str]]
+        Tripletas (nombre_de_tool, argumentos, resultado_json) de cada
+        tool invocada, en el orden de ejecución. Es la entrada del
+        ensamblaje determinista de la fase 2 (ver _assemble_analytics_result)
+        y de la derivación de `flight_context` (ver _derive_flight_context).
     """
     llm_with_tools = get_llm().bind_tools(ANALYTICAL_TOOLS)
 
@@ -102,7 +103,7 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
         HumanMessage(content=f"Consulta del operador: {user_query}{context_line}"),
     ]
 
-    tool_results: list[tuple[str, str]] = []
+    tool_results: list[tuple[str, dict, str]] = []
 
     for _ in range(_MAX_REACT_TURNS):
         response: AIMessage = llm_with_tools.invoke(messages)
@@ -125,7 +126,7 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
                 except Exception as exc:  # noqa: BLE001
                     result_content = f"Error ejecutando '{tool_name}': {exc}"
 
-            tool_results.append((tool_name, str(result_content)))
+            tool_results.append((tool_name, tool_args, str(result_content)))
             messages.append(
                 ToolMessage(content=str(result_content), tool_call_id=tool_call["id"])
             )
@@ -144,7 +145,7 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
 # Fase 2 — Ensamblaje determinista (sin LLM)
 # ---------------------------------------------------------------------------
 
-def _assemble_analytics_result(tool_results: list[tuple[str, str]]) -> AnalyticsResult:
+def _assemble_analytics_result(tool_results: list[tuple[str, dict, str]]) -> AnalyticsResult:
     """
     Construye AnalyticsResult a partir de los resultados JSON que ya
     devolvieron las herramientas, sin pasar por el LLM. Cada tool
@@ -155,7 +156,7 @@ def _assemble_analytics_result(tool_results: list[tuple[str, str]]) -> Analytics
     result: AnalyticsResult = {}
     tools_used: list[str] = []
 
-    for tool_name, content in tool_results:
+    for tool_name, _tool_args, content in tool_results:
         tools_used.append(tool_name)
         field = _TOOL_NAME_TO_FIELD.get(tool_name)
         if field is None:
@@ -168,6 +169,67 @@ def _assemble_analytics_result(tool_results: list[tuple[str, str]]) -> Analytics
 
     result["tools_used"] = tools_used
     return result
+
+
+def _derive_flight_context(tool_results: list[tuple[str, dict, str]]) -> Optional[FlightContext]:
+    """
+    Deriva FlightContext de forma determinista a partir de los argumentos
+    ya usados para invocar `get_flight_historical_stats` (si se llamó),
+    sin ninguna llamada LLM adicional — el LLM ya extrajo esos datos del
+    texto de la consulta al decidir qué tool invocar, aquí solo se
+    reutilizan. Si se invocó más de una vez, gana la última invocación.
+    Devuelve None si no se consultó ningún vuelo concreto.
+    """
+    derived: Optional[FlightContext] = None
+
+    for tool_name, tool_args, _content in tool_results:
+        if tool_name == "get_flight_historical_stats":
+            derived = FlightContext(
+                airline=tool_args.get("airline", ""),
+                origin=tool_args.get("origin", ""),
+                destination=tool_args.get("destination", ""),
+                month=tool_args.get("month", 0),
+                scheduled_dep=tool_args.get("scheduled_dep", 0),
+            )
+
+    return derived
+
+
+def _ensure_cascade_risk_context(analytics_result: AnalyticsResult, flight_context: Any | None) -> None:
+    """
+    Garantiza que `cascade_risk_context` esté disponible cuando hay un
+    vuelo concreto, invocando `get_cascade_risk_context` de forma
+    determinista si el LLM no la solicitó por su cuenta durante el
+    bucle ReAct. El "impacto sobre el resto de operaciones conectadas"
+    es uno de los requisitos de sistema y no puede quedar a discreción
+    del LLM. Modifica `analytics_result` in-place.
+    """
+    if "cascade_risk_context" in analytics_result or not flight_context:
+        return
+
+    origin = flight_context.get("origin")
+    month = flight_context.get("month")
+    scheduled_dep = flight_context.get("scheduled_dep")
+    if not origin or not month or scheduled_dep is None:
+        return
+
+    tool_fn = _TOOLS_BY_NAME.get("get_cascade_risk_context")
+    if tool_fn is None:
+        return
+
+    try:
+        result_content = tool_fn.invoke({
+            "origin": origin,
+            "month": month,
+            "dep_hour": scheduled_dep // 100,
+            "delay_minutes": 0.0,
+        })
+        analytics_result["cascade_risk_context"] = json.loads(result_content)
+    except Exception:  # noqa: BLE001
+        return
+
+    analytics_result.setdefault("tools_used", [])
+    analytics_result["tools_used"].append("get_cascade_risk_context")
 
 
 def _derive_delay_prediction(analytics_result: AnalyticsResult) -> Optional[DelayPrediction]:
@@ -251,6 +313,8 @@ def analytical_agent(state: SGIDAState) -> dict:
             flight_context=state.get("flight_context"),
         )
         analytics_result = _assemble_analytics_result(tool_results)
+        flight_context = state.get("flight_context") or _derive_flight_context(tool_results)
+        _ensure_cascade_risk_context(analytics_result, flight_context)
         delay_prediction = _derive_delay_prediction(analytics_result)
 
     except Exception as exc:  # noqa: BLE001
@@ -269,5 +333,7 @@ def analytical_agent(state: SGIDAState) -> dict:
     }
     if delay_prediction is not None:
         update["delay_prediction"] = delay_prediction
+    if flight_context:
+        update["flight_context"] = flight_context
 
     return update

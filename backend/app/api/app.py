@@ -3,7 +3,9 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.app.api.routes.dashboard import router as dashboard_router
 from backend.app.api.routes.health import router as health_router
+from backend.app.api.routes.notifications import router as notifications_router
 from backend.app.api.routes.query import router as query_router
 
 
@@ -18,6 +20,8 @@ def create_app() -> FastAPI:
     )
     app.include_router(health_router, prefix="/api")
     app.include_router(query_router, prefix="/api")
+    app.include_router(dashboard_router, prefix="/api")
+    app.include_router(notifications_router, prefix="/api")
     return app
 
 

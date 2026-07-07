@@ -1,28 +1,29 @@
 """
 tests/integration/test_supervisor.py
 =========================================
-Tests de integración del supervisor y del StateGraph completo,
-CON EL LLM MOCKEADO.
+Tests de integración del supervisor y del StateGraph completo.
 
-Dos niveles de integración cubiertos:
-  1. supervisor() de forma aislada: la decisión de routing del LLM se
-     traduce correctamente en next_agent, pasando por safe_next_node().
-  2. build_graph() completo: se mockea get_llm() globalmente (afecta a
-     supervisor Y a los tres agentes) para ejecutar un flujo de extremo
-     a extremo sin Ollama, verificando que la topología del grafo
-     conecta correctamente los nodos.
+El supervisor es 100% determinista (ver `revision-supervisor`): ya no
+consulta ningún LLM, así que `TestSupervisorNodeIsolated` no mockea
+nada — llama directamente a `supervisor(state)` y comprueba `next_agent`
+según las reglas de `graph/router.py`.
+
+`TestFullGraphEndToEnd` sigue mockeando `get_llm()` de los tres agentes
+especializados (analítico, disrupción, comunicación), que sí lo usan.
 """
 
 from __future__ import annotations
 
+import json
 from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
 
+from agents.communication_agent import CommunicationOutput
 from graph.state import SGIDAState, initial_state
-from graph.supervisor import RoutingDecision, build_graph, supervisor
+from graph.supervisor import build_graph, supervisor
 
 
 def _copy_state(state: dict) -> SGIDAState:
@@ -36,34 +37,20 @@ def _make_ai_message_no_tool_call(content: str = "Respuesta de prueba."):
     return msg
 
 
+def _make_ai_message_with_tool_call(tool_name: str, tool_args: dict, call_id: str = "call_1"):
+    msg = AIMessage(content="")
+    msg.tool_calls = [{"name": tool_name, "args": tool_args, "id": call_id}]
+    return msg
+
+
 class TestSupervisorNodeIsolated:
-    """Tests del nodo supervisor() de forma aislada (sin el resto del grafo)."""
+    """Tests del nodo supervisor() de forma aislada. Enteramente determinista, sin LLM."""
 
-    @patch("graph.supervisor.get_llm")
-    def test_valid_llm_decision_sets_next_agent(self, mock_get_llm, state_fresh):
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = RoutingDecision(
-            next_node="analytical_agent",
-            rationale="No hay resultados previos; se necesita analizar datos.",
-        )
-        base_llm = MagicMock()
-        base_llm.with_structured_output.return_value = structured_llm
-        mock_get_llm.return_value = base_llm
-
+    def test_routes_to_analytical_agent_when_state_is_fresh(self, state_fresh):
         result = supervisor(_copy_state(state_fresh))
-
         assert result["next_agent"] == "analytical_agent"
 
-    @patch("graph.supervisor.get_llm")
-    def test_increments_iteration_counter(self, mock_get_llm, state_fresh):
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = RoutingDecision(
-            next_node="analytical_agent", rationale="Test."
-        )
-        base_llm = MagicMock()
-        base_llm.with_structured_output.return_value = structured_llm
-        mock_get_llm.return_value = base_llm
-
+    def test_increments_iteration_counter(self, state_fresh):
         state = _copy_state(state_fresh)
         state["iteration"] = 3
 
@@ -71,53 +58,40 @@ class TestSupervisorNodeIsolated:
 
         assert result["iteration"] == 4
 
-    @patch("graph.supervisor.get_llm")
-    def test_routing_decision_passes_through_safety_net(
-        self, mock_get_llm, state_with_exploratory_result
+    def test_routes_to_communication_agent_when_exploratory_result_present(
+        self, state_with_exploratory_result
     ):
-        # El LLM decide (incorrectamente) volver a analytical_agent aunque
-        # ya hay analytics_result; safe_next_node debe corregirlo.
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = RoutingDecision(
-            next_node="analytical_agent",
-            rationale="Decisión incorrecta simulada del LLM.",
-        )
-        base_llm = MagicMock()
-        base_llm.with_structured_output.return_value = structured_llm
-        mock_get_llm.return_value = base_llm
-
         result = supervisor(_copy_state(state_with_exploratory_result))
-
-        # La salvaguarda debe redirigir a communication_agent, no analytical_agent.
         assert result["next_agent"] == "communication_agent"
 
-    @patch("graph.supervisor.get_llm")
-    def test_llm_exception_falls_back_to_communication_agent(
-        self, mock_get_llm, state_fresh
+    def test_routes_to_disruption_agent_when_disruption_detected(
+        self, state_with_disruption_prediction
     ):
-        mock_get_llm.side_effect = RuntimeError("Ollama no responde")
+        result = supervisor(_copy_state(state_with_disruption_prediction))
+        assert result["next_agent"] == "disruption_agent"
 
-        result = supervisor(_copy_state(state_fresh))
-
-        # No debe lanzar excepción; debe degradar a communication_agent
-        # para que el operador reciba algún tipo de respuesta.
+    def test_routes_to_communication_agent_when_disruption_proposal_present(
+        self, state_with_disruption_proposal
+    ):
+        result = supervisor(_copy_state(state_with_disruption_proposal))
         assert result["next_agent"] == "communication_agent"
 
-    @patch("graph.supervisor.get_llm")
-    def test_routing_to_end_when_final_response_exists(
-        self, mock_get_llm, state_with_final_response
-    ):
-        structured_llm = MagicMock()
-        structured_llm.invoke.return_value = RoutingDecision(
-            next_node="END", rationale="La respuesta final ya está lista."
-        )
-        base_llm = MagicMock()
-        base_llm.with_structured_output.return_value = structured_llm
-        mock_get_llm.return_value = base_llm
+    def test_routes_to_communication_agent_when_error_present(self, state_with_error):
+        result = supervisor(_copy_state(state_with_error))
+        assert result["next_agent"] == "communication_agent"
 
+    def test_routes_to_end_when_final_response_exists(self, state_with_final_response):
         result = supervisor(_copy_state(state_with_final_response))
-
         assert result["next_agent"] == "END"
+
+    @patch("config.settings.Settings.GRAPH_MAX_ITERATIONS", 2)
+    def test_respects_iteration_limit(self, state_fresh):
+        state = _copy_state(state_fresh)
+        state["iteration"] = 2
+
+        result = supervisor(state)
+
+        assert result["next_agent"] == "communication_agent"
 
 
 class TestGraphTopology:
@@ -147,33 +121,16 @@ class TestGraphTopology:
 @pytest.mark.requires_db
 class TestFullGraphEndToEnd:
     """
-    Integración de extremo a extremo: grafo completo con LLM mockeado
-    globalmente (afecta a supervisor y a los tres agentes, que importan
-    get_llm desde config.settings o lo usan vía sus propios módulos).
-
-    Marcado con requires_db porque analytical_agent y disruption_agent
-    ejecutan tools reales contra DuckDB durante su fase ReAct.
+    Integración de extremo a extremo: grafo completo con el LLM de los
+    tres agentes especializados mockeado (el supervisor ya no usa LLM).
     """
 
     @patch("agents.communication_agent.get_llm")
     @patch("agents.disruption_agent.get_llm")
     @patch("agents.analytical_agent.get_llm")
-    @patch("graph.supervisor.get_llm")
     def test_exploratory_flow_reaches_end_with_final_response(
-        self, mock_supervisor_llm, mock_analytical_llm,
-        mock_disruption_llm, mock_communication_llm,
+        self, mock_analytical_llm, mock_disruption_llm, mock_communication_llm,
     ):
-        # --- Supervisor: analytical_agent -> communication_agent -> END ---
-        supervisor_structured = MagicMock()
-        supervisor_structured.invoke.side_effect = [
-            RoutingDecision(next_node="analytical_agent", rationale="Falta analizar."),
-            RoutingDecision(next_node="communication_agent", rationale="Ya hay resultado."),
-            RoutingDecision(next_node="END", rationale="Respuesta lista."),
-        ]
-        supervisor_base = MagicMock()
-        supervisor_base.with_structured_output.return_value = supervisor_structured
-        mock_supervisor_llm.return_value = supervisor_base
-
         # --- Agente analítico: sin tool calls, ensamblaje determinista directo ---
         analytical_react = MagicMock()
         analytical_react.invoke.return_value = _make_ai_message_no_tool_call()
@@ -181,13 +138,14 @@ class TestFullGraphEndToEnd:
         analytical_base.bind_tools.return_value = analytical_react
         mock_analytical_llm.return_value = analytical_base
 
-        # --- Agente de comunicación: redacta la respuesta final ---
-        communication_llm = MagicMock()
-        communication_llm.invoke.return_value = _make_ai_message_no_tool_call(
-            "Chicago es el aeropuerto con mayor retraso medio histórico."
+        # --- Agente de comunicación: única llamada with_structured_output ---
+        communication_structured = MagicMock()
+        communication_structured.invoke.return_value = CommunicationOutput(
+            final_response="Chicago es el aeropuerto con mayor retraso medio histórico.",
+            draft_notifications=[],
         )
         communication_base = MagicMock()
-        communication_base.bind_tools.return_value = communication_llm
+        communication_base.with_structured_output.return_value = communication_structured
         mock_communication_llm.return_value = communication_base
 
         # disruption_agent no debería llegar a invocarse en este flujo.
@@ -204,40 +162,61 @@ class TestFullGraphEndToEnd:
         assert final_state["analytics_result"] is not None
         assert final_state["disruption_proposal"] is None
 
-    @patch("graph.supervisor.get_llm")
-    def test_graph_terminates_via_iteration_limit_if_llm_loops(self, mock_supervisor_llm):
-        # El supervisor siempre "decide" volver a analytical_agent, simulando
-        # una decisión defectuosa persistente del LLM. El límite de
-        # iteraciones (vía safe_next_node) debe forzar la terminación.
-        supervisor_structured = MagicMock()
-        supervisor_structured.invoke.return_value = RoutingDecision(
-            next_node="analytical_agent", rationale="Decisión repetida simulada."
+    @patch("agents.communication_agent.get_llm")
+    @patch("agents.disruption_agent.get_llm")
+    @patch("agents.analytical_agent.get_llm")
+    def test_iteration_limit_forces_early_termination_before_disruption_agent(
+        self, mock_analytical_llm, mock_disruption_llm, mock_communication_llm,
+    ):
+        # El agente analítico detecta una disrupción (tool mockeada con
+        # datos garantizados, sin depender del contenido real de la BD).
+        analytical_react = MagicMock()
+        analytical_react.invoke.side_effect = [
+            _make_ai_message_with_tool_call(
+                "get_flight_historical_stats",
+                {"airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+                 "month": 3, "scheduled_dep": 1400},
+            ),
+            _make_ai_message_no_tool_call(),
+        ]
+        analytical_base = MagicMock()
+        analytical_base.bind_tools.return_value = analytical_react
+        mock_analytical_llm.return_value = analytical_base
+
+        fake_stats_tool = MagicMock()
+        fake_stats_tool.invoke.return_value = json.dumps({
+            "airline": "AA", "origin": "Chicago, IL", "destination": "Denver, CO",
+            "month": 3, "scheduled_dep": 1400,
+            "avg_dep_delay_min": 90.0, "avg_arr_delay_min": 95.0,
+            "pct_over_threshold": 80.0, "sample_size": 250,
+            "dominant_delay_cause": "weather",
+        })
+
+        communication_structured = MagicMock()
+        communication_structured.invoke.return_value = CommunicationOutput(
+            final_response="Respuesta forzada por límite de iteraciones.",
+            draft_notifications=[],
         )
-        supervisor_base = MagicMock()
-        supervisor_base.with_structured_output.return_value = supervisor_structured
-        mock_supervisor_llm.return_value = supervisor_base
+        communication_base = MagicMock()
+        communication_base.with_structured_output.return_value = communication_structured
+        mock_communication_llm.return_value = communication_base
 
-        with patch("agents.analytical_agent.get_llm") as mock_analytical_llm, \
-             patch("agents.communication_agent.get_llm") as mock_communication_llm, \
-             patch("config.settings.Settings.GRAPH_MAX_ITERATIONS", 3):
+        # disruption_agent NO debería llegar a ejecutarse: el límite de
+        # iteraciones debe forzar la salida antes de que el supervisor lo alcance,
+        # aunque el estado ya indique una disrupción.
+        mock_disruption_llm.side_effect = AssertionError(
+            "disruption_agent no debería ejecutarse: el límite de iteraciones debe cortar el flujo antes."
+        )
 
-            analytical_react = MagicMock()
-            analytical_react.invoke.return_value = _make_ai_message_no_tool_call()
-            analytical_base = MagicMock()
-            analytical_base.bind_tools.return_value = analytical_react
-            mock_analytical_llm.return_value = analytical_base
-
-            communication_llm = MagicMock()
-            communication_llm.invoke.return_value = _make_ai_message_no_tool_call(
-                "Respuesta forzada por límite de iteraciones."
-            )
-            communication_base = MagicMock()
-            communication_base.bind_tools.return_value = communication_llm
-            mock_communication_llm.return_value = communication_base
-
+        with patch.dict(
+            "agents.analytical_agent._TOOLS_BY_NAME",
+            {"get_flight_historical_stats": fake_stats_tool},
+        ), patch("config.settings.Settings.GRAPH_MAX_ITERATIONS", 1):
             app = build_graph()
-            final_state = app.invoke(initial_state("consulta de prueba"))
+            final_state = app.invoke(
+                initial_state("Predice el retraso del vuelo AA Chicago-Denver en marzo a las 14:00")
+            )
 
-        # El grafo debe terminar (no colgarse en bucle infinito) y producir
-        # una respuesta final gracias a la salvaguarda de iteraciones.
-        assert final_state["final_response"] is not None
+        assert final_state["final_response"] == "Respuesta forzada por límite de iteraciones."
+        assert final_state["disruption_proposal"] is None
+        assert final_state["delay_prediction"]["is_disruption"] is True

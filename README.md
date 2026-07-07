@@ -1,46 +1,121 @@
-Sistema Multiagente para la Gestión Autónoma de Retrasos en el Tráfico Aéreo
-📌 Descripción del Proyecto
+# SGIDA — Sistema Multiagente para la Gestión Autónoma de Retrasos en el Tráfico Aéreo
 
-Este repositorio contiene el código fuente del Trabajo de Fin de Grado (TFG) centrado en el diseño y desarrollo de un sistema multiagente basado en Modelos de Lenguaje (LM). El objetivo principal es mitigar el impacto operativo de los retrasos aéreos, un problema crítico que genera un efecto dominó en la red aeroportuaria.
+## 📌 Descripción del proyecto
 
-El sistema analiza situaciones operativas, anticipa disrupciones y propone respuestas de forma autónoma, utilizando como base de conocimiento un dataset real de vuelos comerciales en Estados Unidos.
+Este repositorio contiene el Trabajo de Fin de Grado (TFG) centrado en el diseño y desarrollo de un sistema multiagente basado en un Modelo de Lenguaje (LLM) local (Ollama). El objetivo es mitigar el impacto operativo de los retrasos aéreos, un problema que genera un efecto dominó en la red aeroportuaria.
 
-🧠 Arquitectura del Sistema Multiagente
+El sistema analiza el histórico de vuelos, predice retrasos y su impacto sobre operaciones conectadas, y propone respuestas de forma autónoma, usando como base de conocimiento un dataset real de vuelos comerciales en EE. UU. (BTS/Kaggle).
 
-El núcleo de la solución se compone de una red de agentes inteligentes especializados y coordinados:
+## 🧠 Arquitectura del sistema multiagente
 
-Agente Orquestador: Coordina la comunicación, distribuye tareas según el contexto operativo y sintetiza las respuestas finales.
+El núcleo es un grafo de agentes (LangGraph) coordinados por un supervisor determinista:
 
-Agente Analítico: Procesa datos históricos y en tiempo real para detectar patrones, identificar rutas problemáticas y predecir el efecto en cadena de los retrasos.
+- **Supervisor** (`graph/supervisor.py`): decide a qué agente salta el flujo en cada paso. Es 100% determinista (sin LLM) — las reglas de routing dependen solo de qué campos del estado ya están rellenos.
+- **Agente Analítico** (`agents/analytical_agent.py`): procesa el histórico de vuelos (DuckDB) para detectar patrones de retraso (rutas, aeropuertos, franjas horarias, causas) y, ante una consulta de vuelo concreto, calcula estadísticas históricas, predice el retraso esperado y su impacto en operaciones conectadas (cascade risk). Devuelve siempre JSON estructurado, nunca lenguaje natural.
+- **Agente de Gestión de Disrupciones** (`agents/disruption_agent.py`): ante una disrupción detectada, evalúa alternativas de reasignación según un criterio configurable (minimizar pasajeros afectados o coste operativo) y propone acciones concretas.
+- **Agente de Comunicación** (`agents/communication_agent.py`): traduce las decisiones del sistema a lenguaje natural para el operador, y redacta (sin enviar) borradores de notificación para operador y pasajeros afectados.
 
-Agente de Gestión de Disrupciones: Razona sobre las opciones ante un retraso detectado y propone soluciones concretas, como la reasignación de pasajeros o la priorización de recursos.
+## ⚙️ Funcionalidades principales
 
-Agente de Comunicación: Traduce las decisiones operativas a lenguaje natural para generar notificaciones a operadores y pasajeros afectados.
+- Análisis exploratorio automatizado de causas, aeropuertos y rutas con mayor incidencia de retrasos.
+- Predicción de retrasos en tiempo real y estimación de su impacto sobre operaciones conectadas.
+- Generación autónoma de propuestas de actuación, con criterio configurable (pasajeros afectados vs. coste operativo).
+- Interfaz conversacional (chat) para interactuar con el sistema en lenguaje natural.
+- Panel de estado (dashboard) con vuelos en riesgo, decisiones del sistema y métricas de rendimiento global.
 
-⚙️ Funcionalidades Principales
+## 🛠️ Stack tecnológico
 
-Análisis exploratorio automatizado de causas, aeropuertos y rutas con alta incidencia de retrasos
+- **Backend**: Python, FastAPI, LangChain + LangGraph, Ollama (LLM local).
+- **Datos**: DuckDB sobre un dataset histórico de vuelos (Parquet).
+- **Frontend**: React + Vite.
+- **Tests**: pytest.
 
-Predicción de retrasos en tiempo real y estimación de su impacto sobre las operaciones conectadas.
+---
 
-Generación autónoma de planes de actuación minimizando el coste operativo y los pasajeros afectados.
+## 🚀 Guía de inicio rápido
 
-Interfaz conversacional para la interacción fluida con operadores en lenguaje natural.
+### 1. Requisitos previos
 
-Panel de visualización (Dashboard) para la monitorización de vuelos en riesgo, decisiones del sistema y métricas de rendimiento.
+- Python 3.11+
+- Node.js 18+ (para el frontend)
+- [Ollama](https://ollama.com) instalado y corriendo localmente
+- El dataset [Flight Delay (Kaggle)](https://www.kaggle.com/datasets/arvindnagaonkar/flight-delay) descargado como `data/Flight_Delay.parquet` (no se sube al repositorio, ver `.gitignore`)
 
-🛠️ Stack Tecnológico
+Descarga el modelo de Ollama que vayas a usar (por defecto `llama3.1`):
 
-Lenguaje principal: Python
+```powershell
+ollama pull llama3.1
+```
 
-Frameworks de Agentes: LangChain o CrewAI.
+### 2. Backend — instalación y datos
 
-Análisis y Procesamiento de Datos: Pandas, NumPy, Scikit-learn, Spark.
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 
-Backend & Frontend: FastAPI, React.
+copy .env.example .env
 
-Base de Datos: MySQL.
+python data\data_ingestion.py
+```
 
-🔄 Metodología
+`data_ingestion.py` valida `data/Flight_Delay.parquet` y construye `data/analytical_db.duckdb`, la base de datos que consultan las tools de los agentes. Es un paso único: solo hace falta repetirlo si cambia el dataset.
 
-El desarrollo sigue una metodología incremental iterativa basada en principios ágiles, estructurada en Sprints de 1 a 2 semanas. Este enfoque permite un ajuste continuo del comportamiento no determinista de los modelos de lenguaje y facilita la integración progresiva de cada agente en el sistema global.
+Revisa `.env` y ajusta lo que necesites (modelo de Ollama, umbral de disrupción, criterio de optimización por defecto, etc.) — ver `.env.example` para todas las variables disponibles.
+
+### 3. Levantar el backend (API)
+
+```powershell
+venv\Scripts\python -m uvicorn backend.main:app --reload
+```
+
+La API queda disponible en `http://127.0.0.1:8000` (documentación interactiva en `http://127.0.0.1:8000/docs`). Endpoints principales, todos bajo `/api`: `/health`, `/query`, `/dashboard`, `/notifications/send`.
+
+### 4. Levantar el frontend
+
+En otra terminal:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Vite sirve el frontend en `http://localhost:5173` (por defecto), con dos pestañas: **Chat** (consulta en lenguaje natural + selector de criterio de optimización) y **Panel de estado** (métricas y actividad reciente). El frontend espera el backend en `http://127.0.0.1:8000/api` (ver `frontend/src/api.js`).
+
+### 5. Alternativa: CLI sin frontend
+
+Para probar el sistema por terminal sin levantar API ni frontend:
+
+```powershell
+venv\Scripts\python main.py
+```
+
+### 6. Ejecutar los tests
+
+```powershell
+venv\Scripts\python -m pytest
+```
+
+Los tests marcados con `requires_db` se omiten automáticamente si `data/analytical_db.duckdb` no existe (en vez de fallar), y los tests de agentes mockean el LLM — no necesitas Ollama corriendo para ejecutar la suite completa.
+
+---
+
+## 📂 Estructura relevante del repositorio
+
+```
+agents/       Nodos LangGraph de cada agente (analítico, disrupción, comunicación)
+graph/        Estado compartido, supervisor y ensamblaje del grafo
+prompts/      Prompts de sistema de cada agente
+tools/        Herramientas (@tool) que consultan DuckDB o simulan notificaciones
+config/       Configuración central (Settings, factoría del LLM)
+data/         Script de ingesta y base de datos DuckDB (generada localmente)
+backend/      API FastAPI (rutas, schemas, servicios) y CLI
+frontend/     Interfaz React (chat + panel de estado)
+tests/        Suite de tests (unit/ e integration/)
+docs/features/  Documentación de cada evolutivo (metodología en AGENTS.md)
+```
+
+## 🔄 Metodología
+
+El desarrollo de evolutivos (nuevas funcionalidades, refactors significativos) sigue la metodología descrita en [`AGENTS.md`](AGENTS.md): análisis → planificación → desglose de tareas → ejecución iterativa → cierre, con trazabilidad completa en `docs/features/<evolutivo>/`.

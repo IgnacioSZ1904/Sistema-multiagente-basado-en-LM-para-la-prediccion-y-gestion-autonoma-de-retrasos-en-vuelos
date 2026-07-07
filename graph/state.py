@@ -34,6 +34,8 @@ from typing_extensions import TypedDict
 from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
 
+from config.settings import Settings
+
 
 # ---------------------------------------------------------------------------
 # Tipos auxiliares (reflejan el dominio del dataset BTS)
@@ -68,6 +70,28 @@ class DelayPrediction(TypedDict):
     #   "carrier" | "weather" | "nas" | "security" | "late_aircraft" | "unknown"
 
 
+class AlternativeCandidate(TypedDict):
+    """Candidato de vuelo alternativo evaluado por el agente de disrupciones."""
+    airline: str
+    scheduled_dep: int
+    avg_arr_delay_min: float
+    reliability_pct: float
+    score: float                       # Puntuación según el criterio de optimización activo
+    selected: bool                     # True solo para el candidato elegido
+
+
+class DisruptionSourceContext(TypedDict, total=False):
+    """
+    Copia embebida del contexto del agente analítico que motivó la
+    propuesta, para que `DisruptionProposal` sea autocontenido de cara
+    a un informe posterior (no requiere volver a leer otros campos del
+    estado).
+    """
+    delay_prediction: DelayPrediction
+    cascade_risk_context: list[CascadeRiskFlight]
+    flight_context: FlightContext
+
+
 class DisruptionProposal(TypedDict):
     """Propuesta de actuación generada por el agente de disrupciones."""
     proposal_id: str                   # Identificador único de la propuesta
@@ -76,6 +100,23 @@ class DisruptionProposal(TypedDict):
     affected_passengers_est: int       # Pasajeros afectados estimados
     alternative_flights: list[str]     # Vuelos alternativos sugeridos
     reasoning: str                     # Razonamiento del agente
+    optimization_criterion: str         # "min_passengers" | "min_cost"
+    alternatives_considered: list[AlternativeCandidate]  # Todas las opciones evaluadas
+    estimated_operational_cost: Optional[float]          # Proxy de coste (ver tools/disruption_tools.py)
+    source_context: DisruptionSourceContext              # Contexto heredado del agente analítico
+
+
+class NotificationDraft(TypedDict):
+    """
+    Borrador de notificación redactado por el agente de comunicación.
+    NO implica que se haya enviado — el envío real (simulado, vía
+    `tools/communication_tools.send_passenger_notification`) es una
+    acción explícita del operador desde el frontend.
+    """
+    recipient_type: str    # "operator" | "passenger" | "ground_staff"
+    channel: str            # "email" | "sms" | "push" | "operator_dashboard"
+    message: str
+    flight_reference: str
 
 
 class RouteStat(TypedDict):
@@ -196,6 +237,16 @@ class SGIDAState(TypedDict):
 
     flight_context: Optional[FlightContext]
     # Vuelo concreto extraído de la consulta (None si la consulta es general).
+    # En la práctica lo deriva `analytical_agent` de forma determinista a
+    # partir de los argumentos con los que el LLM invocó
+    # `get_flight_historical_stats` (sin llamada LLM adicional) — no hay
+    # ningún paso de NLU/extracción separado que lo rellene antes.
+
+    optimization_criterion: str
+    # Criterio de optimización para el agente de disrupciones, elegido por
+    # el operador en la interfaz ("min_passengers" | "min_cost"). Siempre
+    # tiene un valor (initial_state aplica Settings.DEFAULT_OPTIMIZATION_CRITERION
+    # si no se especifica ninguno).
 
     # --- Control de flujo (gestionado por el supervisor) ----------------
     next_agent: str
@@ -222,6 +273,12 @@ class SGIDAState(TypedDict):
     final_response: Optional[str]
     # Rellenado por communication_agent con el texto listo para el operador.
 
+    draft_notifications: list[NotificationDraft]
+    # Rellenado por communication_agent con borradores de notificación
+    # (operador y/o pasajero). Son BORRADORES: el envío real (simulado)
+    # es una acción explícita del operador desde el frontend, no
+    # automática. Lista vacía si no aplica.
+
     # --- Control de errores ---------------------------------------------
     error: Optional[str]
     # Si algún agente captura una excepción, escribe aquí el mensaje.
@@ -233,7 +290,7 @@ class SGIDAState(TypedDict):
 # Estado inicial (factory function)
 # ---------------------------------------------------------------------------
 
-def initial_state(user_query: str) -> SGIDAState:
+def initial_state(user_query: str, optimization_criterion: Optional[str] = None) -> SGIDAState:
     """
     Construye el estado inicial para una nueva consulta del operador.
 
@@ -241,6 +298,10 @@ def initial_state(user_query: str) -> SGIDAState:
     ----------
     user_query : str
         Texto de la consulta tal como la escribe el operador.
+    optimization_criterion : Optional[str]
+        Criterio de optimización elegido por el operador en la interfaz
+        ("min_passengers" | "min_cost"). Si no se especifica, se usa
+        Settings.DEFAULT_OPTIMIZATION_CRITERION.
 
     Returns
     -------
@@ -251,11 +312,13 @@ def initial_state(user_query: str) -> SGIDAState:
         messages=[],
         user_query=user_query,
         flight_context=None,
+        optimization_criterion=optimization_criterion or Settings.DEFAULT_OPTIMIZATION_CRITERION,
         next_agent="supervisor",
         iteration=0,
         analytics_result=None,
         delay_prediction=None,
         disruption_proposal=None,
         final_response=None,
+        draft_notifications=[],
         error=None,
     )

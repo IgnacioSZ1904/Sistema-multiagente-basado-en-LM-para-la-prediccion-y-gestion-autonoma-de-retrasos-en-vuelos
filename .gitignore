@@ -18,3 +18,5 @@ __pycache__/
 *.pdf
 
 frontend/node_modules/*
+
+AGENTS.md
