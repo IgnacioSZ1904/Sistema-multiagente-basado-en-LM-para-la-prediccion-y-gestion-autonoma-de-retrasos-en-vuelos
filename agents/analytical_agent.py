@@ -50,7 +50,7 @@ from typing import Any, Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config.logging_config import get_logger
-from config.settings import Settings, get_llm
+from config.settings import Settings, get_tool_llm
 from graph.state import AnalyticsResult, DelayPrediction, FlightContext, SGIDAState
 from prompts.analytical_prompt import ANALYTICAL_REACT_SYSTEM_PROMPT
 from tools.analytical_tools import ANALYTICAL_TOOLS
@@ -61,6 +61,12 @@ logger = get_logger("analytical_agent")
 # puede incluir varias tool_calls en paralelo. Distinto de
 # Settings.GRAPH_MAX_ITERATIONS, que limita el grafo completo.
 _MAX_REACT_TURNS = 3
+
+# Reintentos por turno ante fallo de la llamada LLM (p. ej. timeout por una
+# inferencia puntualmente lenta en CPU). No resuelve un Ollama caído, pero
+# evita perder todo el bucle ReAct por una respuesta lenta aislada.
+_LLM_INVOKE_MAX_ATTEMPTS = 2
+_LLM_INVOKE_BACKOFF_SECONDS = 2.0
 
 _TOOLS_BY_NAME = {t.name: t for t in ANALYTICAL_TOOLS}
 
@@ -81,6 +87,40 @@ _TOOL_NAME_TO_FIELD = {
 # Fase 1 — Bucle ReAct manual
 # ---------------------------------------------------------------------------
 
+def _invoke_with_retry(llm_with_tools: Any, messages: list, turn: int) -> AIMessage:
+    """
+    Invoca el LLM con reintento ante fallo (p. ej. timeout). Un único
+    reintento con una breve espera basta para cubrir una inferencia
+    puntualmente lenta en CPU sin duplicar la latencia en el caso normal.
+    """
+    last_exc: Exception | None = None
+
+    for attempt in range(1, _LLM_INVOKE_MAX_ATTEMPTS + 1):
+        start = time.perf_counter()
+        try:
+            response = llm_with_tools.invoke(messages)
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            last_exc = exc
+            logger.error(
+                "Llamada LLM (bind_tools, turno %d/%d, intento %d/%d) -> ERROR tras %.0f ms: %s",
+                turn + 1, _MAX_REACT_TURNS, attempt, _LLM_INVOKE_MAX_ATTEMPTS, elapsed_ms, exc,
+            )
+            if attempt < _LLM_INVOKE_MAX_ATTEMPTS:
+                time.sleep(_LLM_INVOKE_BACKOFF_SECONDS)
+                continue
+            raise
+        else:
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.info(
+                "Llamada LLM (bind_tools, turno %d/%d, intento %d/%d) -> OK en %.0f ms",
+                turn + 1, _MAX_REACT_TURNS, attempt, _LLM_INVOKE_MAX_ATTEMPTS, elapsed_ms,
+            )
+            return response
+
+    raise last_exc  # pragma: no cover - inalcanzable: el bucle siempre retorna o relanza
+
+
 def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[str, dict, str]]:
     """
     Ejecuta el bucle ReAct manual: el LLM decide qué herramientas llamar,
@@ -95,7 +135,7 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
         ensamblaje determinista de la fase 2 (ver _assemble_analytics_result)
         y de la derivación de `flight_context` (ver _derive_flight_context).
     """
-    llm_with_tools = get_llm().bind_tools(ANALYTICAL_TOOLS)
+    llm_with_tools = get_tool_llm().bind_tools(ANALYTICAL_TOOLS)
 
     context_line = (
         f"\nContexto del vuelo proporcionado: {flight_context}"
@@ -110,21 +150,7 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
     tool_results: list[tuple[str, dict, str]] = []
 
     for turn in range(_MAX_REACT_TURNS):
-        start = time.perf_counter()
-        try:
-            response: AIMessage = llm_with_tools.invoke(messages)
-        except Exception as exc:  # noqa: BLE001
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.error(
-                "Llamada LLM (bind_tools, turno %d/%d) -> ERROR tras %.0f ms: %s",
-                turn + 1, _MAX_REACT_TURNS, elapsed_ms, exc,
-            )
-            raise
-        elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.info(
-            "Llamada LLM (bind_tools, turno %d/%d) -> OK en %.0f ms",
-            turn + 1, _MAX_REACT_TURNS, elapsed_ms,
-        )
+        response: AIMessage = _invoke_with_retry(llm_with_tools, messages, turn)
         messages.append(response)
 
         if not response.tool_calls:

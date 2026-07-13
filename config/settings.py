@@ -43,7 +43,19 @@ class Settings:
     # --- Parámetros del LLM ----------------------------------------------
     LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.2"))
     LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+    # Los turnos ReAct de bind_tools (analytical_agent) solo emiten
+    # tool_calls, nunca prosa larga, así que usan un límite mucho menor que
+    # LLM_MAX_TOKENS (que sí necesitan communication_agent/disruption_agent
+    # para redactar su narrativa). Esto acota el peor caso de latencia de
+    # decodificación en CPU sin tocar el límite de los otros agentes.
+    LLM_MAX_TOKENS_TOOLS: int = int(os.getenv("LLM_MAX_TOKENS_TOOLS", "256"))
     LLM_REQUEST_TIMEOUT: float = float(os.getenv("LLM_REQUEST_TIMEOUT", "20"))
+    LLM_CONNECT_TIMEOUT: float = float(os.getenv("LLM_CONNECT_TIMEOUT", "10"))
+    # Cuanto tiempo mantiene Ollama el modelo cargado en memoria entre
+    # llamadas (formato Ollama: "30m", "1h", etc.). Sin esto, Ollama usa su
+    # default de 5 minutos y descarga el modelo entre turnos del grafo,
+    # forzando una recarga completa (decenas de segundos) en cada llamada.
+    OLLAMA_KEEP_ALIVE: str = os.getenv("OLLAMA_KEEP_ALIVE", "5m")
 
     # --- Base de datos ---------------------------------------------------
     DB_PATH: str = os.getenv("DB_PATH", "data/analytical_db.duckdb")
@@ -75,6 +87,8 @@ class Settings:
             print(f"  Ollama URL : {cls.OLLAMA_BASE_URL}")
             print(f"  DB path    : {cls.DB_PATH}")
             print(f"  Threshold  : {cls.DELAY_THRESHOLD_MINUTES} min")
+            print(f"  LLM timeout: {cls.LLM_REQUEST_TIMEOUT}s (connect {cls.LLM_CONNECT_TIMEOUT}s)")
+            print(f"  Keep-alive : {cls.OLLAMA_KEEP_ALIVE}")
 
     @classmethod
     def ollama_available(cls) -> bool:
@@ -109,5 +123,36 @@ def get_llm() -> Any:
         base_url=Settings.OLLAMA_BASE_URL,
         temperature=Settings.LLM_TEMPERATURE,
         num_predict=Settings.LLM_MAX_TOKENS,
-        client_kwargs={"timeout": Settings.LLM_REQUEST_TIMEOUT},
+        keep_alive=Settings.OLLAMA_KEEP_ALIVE,
+        client_kwargs={
+            "timeout": httpx.Timeout(
+                Settings.LLM_REQUEST_TIMEOUT, connect=Settings.LLM_CONNECT_TIMEOUT
+            )
+        },
+    )
+
+
+@lru_cache(maxsize=1)
+def get_tool_llm() -> Any:
+    """
+    Devuelve la instancia de ChatOllama para el bucle ReAct de bind_tools
+    (analytical_agent). Misma configuración que get_llm() salvo
+    num_predict, mucho más bajo (ver LLM_MAX_TOKENS_TOOLS) porque estos
+    turnos solo deciden qué tool_call emitir.
+    """
+    from langchain_ollama import ChatOllama
+
+    Settings.validate()
+
+    return ChatOllama(
+        model=Settings.OLLAMA_MODEL,
+        base_url=Settings.OLLAMA_BASE_URL,
+        temperature=Settings.LLM_TEMPERATURE,
+        num_predict=Settings.LLM_MAX_TOKENS_TOOLS,
+        keep_alive=Settings.OLLAMA_KEEP_ALIVE,
+        client_kwargs={
+            "timeout": httpx.Timeout(
+                Settings.LLM_REQUEST_TIMEOUT, connect=Settings.LLM_CONNECT_TIMEOUT
+            )
+        },
     )
