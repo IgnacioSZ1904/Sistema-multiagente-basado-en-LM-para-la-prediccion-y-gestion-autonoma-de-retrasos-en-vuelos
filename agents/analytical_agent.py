@@ -44,14 +44,18 @@ sustituye por un ENSAMBLAJE DETERMINISTA en código:
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from config.logging_config import get_logger
 from config.settings import Settings, get_llm
 from graph.state import AnalyticsResult, DelayPrediction, FlightContext, SGIDAState
 from prompts.analytical_prompt import ANALYTICAL_REACT_SYSTEM_PROMPT
 from tools.analytical_tools import ANALYTICAL_TOOLS
+
+logger = get_logger("analytical_agent")
 
 # Máximo de turnos ReAct (llamadas al LLM) dentro de este agente. Un turno
 # puede incluir varias tool_calls en paralelo. Distinto de
@@ -105,8 +109,22 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
 
     tool_results: list[tuple[str, dict, str]] = []
 
-    for _ in range(_MAX_REACT_TURNS):
-        response: AIMessage = llm_with_tools.invoke(messages)
+    for turn in range(_MAX_REACT_TURNS):
+        start = time.perf_counter()
+        try:
+            response: AIMessage = llm_with_tools.invoke(messages)
+        except Exception as exc:  # noqa: BLE001
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            logger.error(
+                "Llamada LLM (bind_tools, turno %d/%d) -> ERROR tras %.0f ms: %s",
+                turn + 1, _MAX_REACT_TURNS, elapsed_ms, exc,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "Llamada LLM (bind_tools, turno %d/%d) -> OK en %.0f ms",
+            turn + 1, _MAX_REACT_TURNS, elapsed_ms,
+        )
         messages.append(response)
 
         if not response.tool_calls:
@@ -118,13 +136,24 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
             tool_args = tool_call["args"]
             tool_fn = _TOOLS_BY_NAME.get(tool_name)
 
+            tool_start = time.perf_counter()
             if tool_fn is None:
                 result_content = f"Error: herramienta '{tool_name}' no existe."
+                logger.error("Tool '%s' no existe (args=%s)", tool_name, tool_args)
             else:
                 try:
                     result_content = tool_fn.invoke(tool_args)
+                    tool_elapsed_ms = (time.perf_counter() - tool_start) * 1000
+                    logger.info(
+                        "Tool '%s'(%s) -> OK en %.0f ms", tool_name, tool_args, tool_elapsed_ms
+                    )
                 except Exception as exc:  # noqa: BLE001
+                    tool_elapsed_ms = (time.perf_counter() - tool_start) * 1000
                     result_content = f"Error ejecutando '{tool_name}': {exc}"
+                    logger.error(
+                        "Tool '%s'(%s) -> ERROR tras %.0f ms: %s",
+                        tool_name, tool_args, tool_elapsed_ms, exc,
+                    )
 
             tool_results.append((tool_name, tool_args, str(result_content)))
             messages.append(
@@ -132,11 +161,10 @@ def _run_react_loop(user_query: str, flight_context: Any | None) -> list[tuple[s
             )
     else:
         # Se alcanzó _MAX_REACT_TURNS sin que el LLM se detuviera por sí mismo.
-        if Settings.DEBUG_MODE:
-            print(
-                f"[analytical_agent] Límite de {_MAX_REACT_TURNS} turnos "
-                "ReAct alcanzado; se ensambla el resultado con lo disponible."
-            )
+        logger.warning(
+            "Limite de %d turnos ReAct alcanzado; se ensambla el resultado con lo disponible.",
+            _MAX_REACT_TURNS,
+        )
 
     return tool_results
 
@@ -217,15 +245,27 @@ def _ensure_cascade_risk_context(analytics_result: AnalyticsResult, flight_conte
     if tool_fn is None:
         return
 
+    tool_args = {
+        "origin": origin,
+        "month": month,
+        "dep_hour": scheduled_dep // 100,
+        "delay_minutes": 0.0,
+    }
+    start = time.perf_counter()
     try:
-        result_content = tool_fn.invoke({
-            "origin": origin,
-            "month": month,
-            "dep_hour": scheduled_dep // 100,
-            "delay_minutes": 0.0,
-        })
+        result_content = tool_fn.invoke(tool_args)
         analytics_result["cascade_risk_context"] = json.loads(result_content)
-    except Exception:  # noqa: BLE001
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info(
+            "Tool 'get_cascade_risk_context'(%s) -> OK en %.0f ms (invocacion determinista)",
+            tool_args, elapsed_ms,
+        )
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.error(
+            "Tool 'get_cascade_risk_context'(%s) -> ERROR tras %.0f ms: %s",
+            tool_args, elapsed_ms, exc,
+        )
         return
 
     analytics_result.setdefault("tools_used", [])
@@ -318,6 +358,7 @@ def analytical_agent(state: SGIDAState) -> dict:
         delay_prediction = _derive_delay_prediction(analytics_result)
 
     except Exception as exc:  # noqa: BLE001
+        logger.error("analytical_agent fallo: %s", exc, exc_info=Settings.DEBUG_MODE)
         return {"error": f"Error en analytical_agent: {exc}"}
 
     tools_used = analytics_result.get("tools_used", [])
@@ -325,6 +366,10 @@ def analytical_agent(state: SGIDAState) -> dict:
         f"[analytical_agent] tools consultadas: {', '.join(tools_used)}"
         if tools_used
         else "[analytical_agent] no se consultó ninguna herramienta."
+    )
+    logger.info(
+        "analytical_agent resumen: tools=%s, delay_prediction=%s",
+        tools_used or "[]", "is_disruption=" + str(delay_prediction["is_disruption"]) if delay_prediction else "N/A",
     )
 
     update: dict = {

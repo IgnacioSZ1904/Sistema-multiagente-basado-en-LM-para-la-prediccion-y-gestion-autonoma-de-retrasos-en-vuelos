@@ -24,13 +24,17 @@ rápido y fiable).
 from __future__ import annotations
 
 import json
+import time
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from config.logging_config import get_logger
 from config.settings import Settings, get_llm
 from graph.state import SGIDAState
 from prompts.communication_prompt import COMMUNICATION_SYSTEM_PROMPT
+
+logger = get_logger("communication_agent")
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +120,7 @@ def communication_agent(state: SGIDAState) -> dict:
     final_text: str | None = None
     draft_notifications: list[dict] = []
 
+    start = time.perf_counter()
     try:
         structured_llm = get_llm().with_structured_output(CommunicationOutput)
 
@@ -132,9 +137,12 @@ def communication_agent(state: SGIDAState) -> dict:
         final_text = result.final_response
         draft_notifications = [draft.model_dump() for draft in result.draft_notifications]
 
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info("Llamada LLM (with_structured_output) -> OK en %.0f ms", elapsed_ms)
+
     except Exception as exc:  # noqa: BLE001
-        if Settings.DEBUG_MODE:
-            print(f"[communication_agent] Error: {exc}")
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.error("Llamada LLM (with_structured_output) -> ERROR tras %.0f ms: %s", elapsed_ms, exc)
         final_text = (
             "No se ha podido generar una respuesta completa debido a un "
             "problema interno. Por favor, reformula tu consulta o inténtalo "

@@ -27,15 +27,20 @@ del routing.
 
 from __future__ import annotations
 
-from typing import cast
+import time
+from typing import Callable, cast
 
 from langgraph.graph import END, StateGraph
 
 from agents.analytical_agent import analytical_agent
 from agents.communication_agent import communication_agent
 from agents.disruption_agent import disruption_agent
+from config.logging_config import get_logger
 from graph.router import END_NODE, safe_next_node
 from graph.state import SGIDAState, initial_state
+
+logger = get_logger("supervisor")
+node_logger = get_logger("graph.node")
 
 
 # ---------------------------------------------------------------------------
@@ -50,9 +55,12 @@ def supervisor(state: SGIDAState) -> dict:
     iteraciones, nombres de nodo inválidos, no repetir un agente ya
     completado).
     """
+    next_agent = safe_next_node(state, "")
+    iteration = state["iteration"] + 1
+    logger.info("Supervisor -> %s (iteracion %d)", next_agent, iteration)
     return {
-        "next_agent": safe_next_node(state, ""),
-        "iteration": state["iteration"] + 1,
+        "next_agent": next_agent,
+        "iteration": iteration,
     }
 
 
@@ -63,6 +71,28 @@ def _route_from_supervisor(state: SGIDAState) -> str:
     identificador de destino que espera add_conditional_edges.
     """
     return END if state["next_agent"] == END_NODE else state["next_agent"]
+
+
+# ---------------------------------------------------------------------------
+# Instrumentación de nodos (trazabilidad de "qué agente está activo")
+# ---------------------------------------------------------------------------
+
+def _with_node_logging(name: str, fn: Callable[[SGIDAState], dict]) -> Callable[[SGIDAState], dict]:
+    """
+    Envuelve un nodo del grafo para loggear su entrada, salida y
+    duración sin modificar el cuerpo de cada agente. Único punto de
+    instrumentación para las 4 transiciones de nodo del grafo.
+    """
+
+    def _wrapped(state: SGIDAState) -> dict:
+        node_logger.info(">> Entrando en nodo '%s'", name)
+        start = time.perf_counter()
+        result = fn(state)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        node_logger.info("<< Nodo '%s' completado en %.0f ms", name, elapsed_ms)
+        return result
+
+    return _wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +121,10 @@ def build_graph():
     """
     graph = StateGraph(SGIDAState)
 
-    graph.add_node("supervisor", supervisor)
-    graph.add_node("analytical_agent", analytical_agent)
-    graph.add_node("disruption_agent", disruption_agent)
-    graph.add_node("communication_agent", communication_agent)
+    graph.add_node("supervisor", _with_node_logging("supervisor", supervisor))
+    graph.add_node("analytical_agent", _with_node_logging("analytical_agent", analytical_agent))
+    graph.add_node("disruption_agent", _with_node_logging("disruption_agent", disruption_agent))
+    graph.add_node("communication_agent", _with_node_logging("communication_agent", communication_agent))
 
     graph.set_entry_point("supervisor")
 

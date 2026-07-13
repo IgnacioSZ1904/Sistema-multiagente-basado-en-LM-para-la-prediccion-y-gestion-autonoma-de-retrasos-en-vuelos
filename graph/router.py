@@ -14,8 +14,11 @@ negocio que decide A QUÉ agente ir.
 
 from __future__ import annotations
 
+from config.logging_config import get_logger
 from config.settings import Settings
 from graph.state import SGIDAState
+
+logger = get_logger("router")
 
 # Nombres de nodo válidos — deben coincidir exactamente con los
 # registrados en graph/supervisor.py al construir el StateGraph.
@@ -63,17 +66,25 @@ def safe_next_node(state: SGIDAState, llm_decision: str) -> str:
 
     # --- Salvaguarda 1: límite de iteraciones -----------------------------
     if state["iteration"] >= Settings.GRAPH_MAX_ITERATIONS:
-        if Settings.DEBUG_MODE:
-            print(
-                f"[router] Límite de {Settings.GRAPH_MAX_ITERATIONS} "
-                "iteraciones alcanzado; forzando salida del grafo."
-            )
+        logger.warning(
+            "Limite de %d iteraciones alcanzado; forzando salida del grafo.",
+            Settings.GRAPH_MAX_ITERATIONS,
+        )
         return END_NODE if state.get("final_response") else "communication_agent"
 
     # --- Salvaguarda 2: nombre de nodo inválido ---------------------------
     if decision not in VALID_AGENT_NODES and decision != END_NODE:
-        if Settings.DEBUG_MODE:
-            print(f"[router] Decisión de routing inválida: '{decision}'. Aplicando fallback.")
+        if decision:
+            # Cadena no vacía que no es un nodo válido: sí sería una
+            # anomalía (p.ej. si en el futuro un LLM vuelve a decidir
+            # el routing y devuelve basura).
+            logger.warning("Decision de routing invalida: '%s'. Aplicando fallback.", decision)
+        else:
+            # Cadena vacía: es el valor que graph/supervisor.py pasa
+            # siempre en el diseño 100% determinista actual (no hay LLM
+            # decidiendo el routing). No es una anomalía, así que no se
+            # loggea como warning.
+            logger.debug("Routing determinista (sin decision de LLM); aplicando fallback.")
         decision = _deterministic_fallback(state)
 
     # --- Salvaguarda 3: evitar repetir un agente ya completado ------------

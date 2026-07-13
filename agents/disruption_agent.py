@@ -31,12 +31,14 @@ la parte que realmente requiere lenguaje natural, no aritmética.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from typing import Any, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from config.logging_config import get_logger
 from config.settings import Settings, get_llm
 from graph.state import (
     AlternativeCandidate,
@@ -50,6 +52,8 @@ from tools.disruption_tools import (
     find_alternative_flights,
     get_airport_ground_activity,
 )
+
+logger = get_logger("disruption_agent")
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,28 @@ class DisruptionNarrative(BaseModel):
 # Recogida determinista de datos (sin LLM)
 # ---------------------------------------------------------------------------
 
+def _invoke_tool_logged(tool: Any, tool_args: dict) -> Any:
+    """
+    Invoca una tool determinista y loggea nombre, argumentos, éxito/error
+    y duración. Punto único de instrumentación para las 3 tools de este
+    agente (ver diseño en 02_planificacion.md del evolutivo
+    logs-trazabilidad-agentes).
+    """
+    tool_name = tool.name
+    start = time.perf_counter()
+    try:
+        result = tool.invoke(tool_args)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.info("Tool '%s'(%s) -> OK en %.0f ms", tool_name, tool_args, elapsed_ms)
+        return result
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.error(
+            "Tool '%s'(%s) -> ERROR tras %.0f ms: %s", tool_name, tool_args, elapsed_ms, exc
+        )
+        raise
+
+
 def _gather_disruption_data(flight_context: dict) -> dict:
     """
     Invoca directamente las 3 tools de disrupción con los argumentos
@@ -96,7 +122,7 @@ def _gather_disruption_data(flight_context: dict) -> dict:
 
     if origin and destination and scheduled_dep is not None:
         try:
-            alternative_candidates = json.loads(find_alternative_flights.invoke({
+            alternative_candidates = json.loads(_invoke_tool_logged(find_alternative_flights, {
                 "origin": origin,
                 "destination": destination,
                 "scheduled_dep": scheduled_dep,
@@ -107,7 +133,7 @@ def _gather_disruption_data(flight_context: dict) -> dict:
 
     if airline and origin and destination and month is not None:
         try:
-            passenger_estimate = json.loads(estimate_affected_passengers.invoke({
+            passenger_estimate = json.loads(_invoke_tool_logged(estimate_affected_passengers, {
                 "airline": airline,
                 "origin": origin,
                 "destination": destination,
@@ -118,7 +144,7 @@ def _gather_disruption_data(flight_context: dict) -> dict:
 
     if origin and scheduled_dep is not None:
         try:
-            ground_activity = json.loads(get_airport_ground_activity.invoke({
+            ground_activity = json.loads(_invoke_tool_logged(get_airport_ground_activity, {
                 "origin": origin,
                 "scheduled_dep": scheduled_dep,
             }))
@@ -251,10 +277,18 @@ def _synthesize(
         f"{json.dumps(context, ensure_ascii=False, default=str)}"
     )
 
-    result = structured_llm.invoke([
-        SystemMessage(content=DISRUPTION_STRUCTURED_SYSTEM_PROMPT),
-        HumanMessage(content=synthesis_prompt),
-    ])
+    start = time.perf_counter()
+    try:
+        result = structured_llm.invoke([
+            SystemMessage(content=DISRUPTION_STRUCTURED_SYSTEM_PROMPT),
+            HumanMessage(content=synthesis_prompt),
+        ])
+    except Exception as exc:  # noqa: BLE001
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        logger.error("Llamada LLM (with_structured_output) -> ERROR tras %.0f ms: %s", elapsed_ms, exc)
+        raise
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info("Llamada LLM (with_structured_output) -> OK en %.0f ms", elapsed_ms)
 
     if isinstance(result, DisruptionNarrative):
         return result
@@ -336,6 +370,7 @@ def disruption_agent(state: SGIDAState) -> dict:
         )
 
     except Exception as exc:  # noqa: BLE001
+        logger.error("disruption_agent fallo: %s", exc, exc_info=Settings.DEBUG_MODE)
         return {"error": f"Error en disruption_agent: {exc}"}
 
     alternative_flights = (
@@ -353,6 +388,11 @@ def disruption_agent(state: SGIDAState) -> dict:
         alternatives_considered=alternatives_considered,
         estimated_operational_cost=estimated_cost,
         source_context=source_context,
+    )
+
+    logger.info(
+        "disruption_agent resumen: severity=%s, alternativas_evaluadas=%d, coste_estimado=%s",
+        severity, len(alternatives_considered), estimated_cost,
     )
 
     return {
