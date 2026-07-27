@@ -4,6 +4,7 @@
 venv/*
 .python-version
 data/*.duckdb
+data/models/*
 
 # Datos y archivos pesados (No subir datasets a GitHub)
 *.parquet

@@ -60,6 +60,12 @@ class Settings:
     # --- Base de datos ---------------------------------------------------
     DB_PATH: str = os.getenv("DB_PATH", "data/analytical_db.duckdb")
 
+    # --- Modelo predictivo de retrasos (evolutivo prediccion-ml-real) ----
+    # Artefacto entrenado por data/train_delay_model.py. Si el fichero no
+    # existe o falla la carga, analytical_agent cae al heurístico SQL
+    # anterior (mismo patrón de modo degradado que ollama_available()).
+    DELAY_MODEL_PATH: str = os.getenv("DELAY_MODEL_PATH", "data/models/delay_model.joblib")
+
     # --- Parámetros del grafo -------------------------------------------
     GRAPH_MAX_ITERATIONS: int = int(os.getenv("GRAPH_MAX_ITERATIONS", "6"))
 

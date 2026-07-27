@@ -127,7 +127,7 @@ class TestFullGraphEndToEnd:
 
     @patch("agents.communication_agent.get_llm")
     @patch("agents.disruption_agent.get_llm")
-    @patch("agents.analytical_agent.get_llm")
+    @patch("agents.analytical_agent.get_tool_llm")
     def test_exploratory_flow_reaches_end_with_final_response(
         self, mock_analytical_llm, mock_disruption_llm, mock_communication_llm,
     ):
@@ -164,12 +164,17 @@ class TestFullGraphEndToEnd:
 
     @patch("agents.communication_agent.get_llm")
     @patch("agents.disruption_agent.get_llm")
-    @patch("agents.analytical_agent.get_llm")
+    @patch("agents.analytical_agent.get_tool_llm")
+    @patch("agents.analytical_agent._load_delay_model", return_value=None)
     def test_iteration_limit_forces_early_termination_before_disruption_agent(
-        self, mock_analytical_llm, mock_disruption_llm, mock_communication_llm,
+        self, mock_load_delay_model, mock_analytical_llm, mock_disruption_llm, mock_communication_llm,
     ):
         # El agente analítico detecta una disrupción (tool mockeada con
         # datos garantizados, sin depender del contenido real de la BD).
+        # _load_delay_model se mockea a None para forzar el heurístico SQL
+        # (ver prediccion-ml-real): este test valida el límite de
+        # iteraciones del supervisor, no qué método calcula delay_prediction,
+        # así que no debe depender de si hay un artefacto de modelo real en disco.
         analytical_react = MagicMock()
         analytical_react.invoke.side_effect = [
             _make_ai_message_with_tool_call(

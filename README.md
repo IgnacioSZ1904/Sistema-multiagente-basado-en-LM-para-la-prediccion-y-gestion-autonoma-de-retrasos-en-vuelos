@@ -11,7 +11,7 @@ El sistema analiza el histórico de vuelos, predice retrasos y su impacto sobre 
 El núcleo es un grafo de agentes (LangGraph) coordinados por un supervisor determinista:
 
 - **Supervisor** (`graph/supervisor.py`): decide a qué agente salta el flujo en cada paso. Es 100% determinista (sin LLM) — las reglas de routing dependen solo de qué campos del estado ya están rellenos.
-- **Agente Analítico** (`agents/analytical_agent.py`): procesa el histórico de vuelos (DuckDB) para detectar patrones de retraso (rutas, aeropuertos, franjas horarias, causas) y, ante una consulta de vuelo concreto, calcula estadísticas históricas, predice el retraso esperado y su impacto en operaciones conectadas (cascade risk). Devuelve siempre JSON estructurado, nunca lenguaje natural.
+- **Agente Analítico** (`agents/analytical_agent.py`): procesa el histórico de vuelos (DuckDB) para detectar patrones de retraso (rutas, aeropuertos, franjas horarias, causas) y, ante una consulta de vuelo concreto, calcula estadísticas históricas y predice el retraso esperado y su impacto en operaciones conectadas (cascade risk). La predicción usa un modelo Random Forest (scikit-learn) entrenado sobre el histórico completo (`data/train_delay_model.py`), con un heurístico SQL como respaldo automático si el modelo no está disponible — ver `docs/features/prediccion-ml-real/`. Devuelve siempre JSON estructurado, nunca lenguaje natural.
 - **Agente de Gestión de Disrupciones** (`agents/disruption_agent.py`): ante una disrupción detectada, evalúa alternativas de reasignación según un criterio configurable (minimizar pasajeros afectados o coste operativo) y propone acciones concretas.
 - **Agente de Comunicación** (`agents/communication_agent.py`): traduce las decisiones del sistema a lenguaje natural para el operador, y redacta (sin enviar) borradores de notificación para operador y pasajeros afectados.
 
@@ -61,7 +61,15 @@ python data\data_ingestion.py
 
 `data_ingestion.py` valida `data/Flight_Delay.parquet` y construye `data/analytical_db.duckdb`, la base de datos que consultan las tools de los agentes. Es un paso único: solo hace falta repetirlo si cambia el dataset.
 
-Revisa `.env` y ajusta lo que necesites (modelo de Ollama, umbral de disrupción, criterio de optimización por defecto, etc.) — ver `.env.example` para todas las variables disponibles.
+Con la base de datos ya creada, entrena el modelo predictivo de retrasos (evolutivo `prediccion-ml-real`):
+
+```powershell
+venv\Scripts\python data\train_delay_model.py
+```
+
+Este script entrena, sobre `data/analytical_db.duckdb`, un regresor y un clasificador (scikit-learn) que sustituyen al heurístico SQL como fuente de `delay_prediction`, y guarda el artefacto en `data/models/delay_model.joblib` (no versionado en git). Es también un paso único: solo hace falta repetirlo si cambia el dataset o si se quiere reentrenar con otros hiperparámetros. Si no se ejecuta (o el artefacto no existe), `analytical_agent` cae automáticamente al heurístico SQL anterior — el sistema funciona igualmente, solo que sin el modelo entrenado. Métricas y proceso de evaluación documentados en `docs/features/prediccion-ml-real/model_evaluacion.md`.
+
+Revisa `.env` y ajusta lo que necesites (modelo de Ollama, umbral de disrupción, criterio de optimización por defecto, ruta del modelo predictivo, etc.) — ver `.env.example` para todas las variables disponibles.
 
 ### 3. Levantar el backend (API)
 
@@ -109,7 +117,7 @@ graph/        Estado compartido, supervisor y ensamblaje del grafo
 prompts/      Prompts de sistema de cada agente
 tools/        Herramientas (@tool) que consultan DuckDB o simulan notificaciones
 config/       Configuración central (Settings, factoría del LLM)
-data/         Script de ingesta y base de datos DuckDB (generada localmente)
+data/         Script de ingesta, entrenamiento del modelo predictivo y base de datos DuckDB (generados localmente)
 backend/      API FastAPI (rutas, schemas, servicios) y CLI
 frontend/     Interfaz React (chat + panel de estado)
 tests/        Suite de tests (unit/ e integration/)

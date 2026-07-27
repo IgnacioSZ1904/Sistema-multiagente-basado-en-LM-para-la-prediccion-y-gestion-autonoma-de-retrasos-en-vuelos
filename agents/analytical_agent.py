@@ -45,8 +45,12 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 from typing import Any, Optional
 
+import duckdb
+import joblib
+import numpy as np
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from config.logging_config import get_logger
@@ -56,6 +60,10 @@ from prompts.analytical_prompt import ANALYTICAL_REACT_SYSTEM_PROMPT
 from tools.analytical_tools import ANALYTICAL_TOOLS
 
 logger = get_logger("analytical_agent")
+
+# Caché del artefacto del modelo predictivo (data/train_delay_model.py),
+# cargado una sola vez por proceso. Ver _load_delay_model().
+_DELAY_MODEL_CACHE: dict[str, Any] = {}
 
 # Máximo de turnos ReAct (llamadas al LLM) dentro de este agente. Un turno
 # puede incluir varias tool_calls en paralelo. Distinto de
@@ -225,6 +233,24 @@ def _assemble_analytics_result(tool_results: list[tuple[str, dict, str]]) -> Ana
     return result
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """
+    Normaliza a int un argumento numérico que el LLM puede haber
+    devuelto como string (p. ej. scheduled_dep="0700"): `tool_call["args"]`
+    guarda el valor TAL CUAL lo generó el LLM en su mensaje, sin la
+    coerción de tipos que sí aplica LangChain al invocar la tool de
+    verdad (`tool_fn.invoke(...)`, que sí valida contra la firma
+    tipada) — por eso `get_flight_historical_stats` funciona igual con
+    "0700" que con 700, pero el código que reutiliza esos mismos
+    argumentos crudos después (aquí: `_ensure_cascade_risk_context`,
+    `_build_model_features`) no puede asumir que ya son `int`.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _derive_flight_context(tool_results: list[tuple[str, dict, str]]) -> Optional[FlightContext]:
     """
     Deriva FlightContext de forma determinista a partir de los argumentos
@@ -242,8 +268,8 @@ def _derive_flight_context(tool_results: list[tuple[str, dict, str]]) -> Optiona
                 airline=tool_args.get("airline", ""),
                 origin=tool_args.get("origin", ""),
                 destination=tool_args.get("destination", ""),
-                month=tool_args.get("month", 0),
-                scheduled_dep=tool_args.get("scheduled_dep", 0),
+                month=_coerce_int(tool_args.get("month", 0)),
+                scheduled_dep=_coerce_int(tool_args.get("scheduled_dep", 0)),
             )
 
     return derived
@@ -298,10 +324,11 @@ def _ensure_cascade_risk_context(analytics_result: AnalyticsResult, flight_conte
     analytics_result["tools_used"].append("get_cascade_risk_context")
 
 
-def _derive_delay_prediction(analytics_result: AnalyticsResult) -> Optional[DelayPrediction]:
+def _derive_delay_prediction_heuristic(analytics_result: AnalyticsResult) -> Optional[DelayPrediction]:
     """
     Deriva la predicción de retraso de forma determinista a partir de
-    `flight_historical_stats` (si esa tool fue invocada). Sin
+    `flight_historical_stats` (si esa tool fue invocada), promediando
+    por SQL la combinación exacta (aerolínea+ruta+mes+hora). Sin
     interpretación del LLM:
 
     - `is_disruption`: el retraso medio en llegada supera el umbral
@@ -313,6 +340,10 @@ def _derive_delay_prediction(analytics_result: AnalyticsResult) -> Optional[Dela
       (`dominant_delay_cause`), no una interpretación adicional.
 
     Devuelve None si no se consultaron estadísticas de un vuelo concreto.
+
+    FALLBACK: se usa solo cuando el modelo entrenado
+    (data/train_delay_model.py) no está disponible o no puede
+    calcularse para el vuelo consultado — ver `_derive_delay_prediction`.
     """
     stats = analytics_result.get("flight_historical_stats")
     if not stats:
@@ -344,6 +375,195 @@ def _derive_delay_prediction(analytics_result: AnalyticsResult) -> Optional[Dela
         confidence=confidence,
         main_cause=stats.get("dominant_delay_cause") or "unknown",
     )
+
+
+# ---------------------------------------------------------------------------
+# Predicción de retraso vía modelo ML (evolutivo prediccion-ml-real)
+# ---------------------------------------------------------------------------
+
+def _load_delay_model() -> Optional[dict]:
+    """
+    Carga perezosa y cacheada (a nivel de módulo, una vez por proceso)
+    del artefacto serializado por `data/train_delay_model.py`. Devuelve
+    None -sin lanzar excepción- si el fichero no existe o falla la
+    carga; el llamador cae entonces al heurístico SQL
+    (`_derive_delay_prediction_heuristic`), mismo patrón de modo
+    degradado que ya usa `Settings.ollama_available()`.
+    """
+    if "model" in _DELAY_MODEL_CACHE:
+        return _DELAY_MODEL_CACHE["model"]
+
+    model_path = Path(Settings.DELAY_MODEL_PATH)
+    if not model_path.exists():
+        logger.warning(
+            "Modelo de retrasos no encontrado en %s; se usa el heurístico SQL.", model_path
+        )
+        _DELAY_MODEL_CACHE["model"] = None
+        return None
+
+    try:
+        artifact = joblib.load(model_path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Error cargando el modelo de retrasos (%s): %s; se usa el heurístico SQL.",
+            model_path, exc,
+        )
+        _DELAY_MODEL_CACHE["model"] = None
+        return None
+
+    logger.info(
+        "Modelo de retrasos cargado desde %s (entrenado %s)",
+        model_path, artifact.get("trained_at"),
+    )
+    _DELAY_MODEL_CACHE["model"] = artifact
+    return artifact
+
+
+def _lookup_route_distance(origin: str, destination: str) -> Optional[float]:
+    """
+    Distancia media histórica (millas) de una ruta origen-destino,
+    consultada directamente a DuckDB (no expuesta como `@tool`, mismo
+    patrón que `_ensure_cascade_risk_context`). Completa la feature
+    `distance` del modelo cuando `flight_context` no la trae -el
+    operador nunca la aporta hoy en su consulta-.
+    """
+    sql = """
+        SELECT AVG(Distance) AS avg_distance
+        FROM flights
+        WHERE OriginCityName = ? AND DestCityName = ? AND Distance IS NOT NULL
+    """
+    try:
+        with duckdb.connect(Settings.DB_PATH, read_only=True) as con:
+            row = con.execute(sql, [origin, destination]).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Error consultando distancia de ruta (%s -> %s): %s", origin, destination, exc
+        )
+        return None
+    return row[0] if row and row[0] is not None else None
+
+
+def _build_model_features(flight_context: dict, artifact: dict) -> Optional[np.ndarray]:
+    """
+    Construye el vector de features codificado que espera el modelo a
+    partir de `flight_context`. Devuelve None si falta algún dato
+    obligatorio (airline/origin/destination/month/scheduled_dep) o si
+    no se puede determinar la distancia de la ruta -ni en
+    `flight_context` ni por `_lookup_route_distance`-.
+    """
+    airline = flight_context.get("airline")
+    origin = flight_context.get("origin")
+    destination = flight_context.get("destination")
+    month = flight_context.get("month")
+    scheduled_dep = flight_context.get("scheduled_dep")
+
+    if not airline or not origin or not destination or not month or scheduled_dep is None:
+        return None
+
+    distance = flight_context.get("distance")
+    if distance is None:
+        distance = _lookup_route_distance(origin, destination)
+    if distance is None:
+        return None
+
+    encoders = artifact["encoders"]
+    try:
+        computed = {
+            "airline": encoders["airline"].transform([[airline]])[0][0],
+            "origin": encoders["origin"].transform([[origin]])[0][0],
+            "destination": encoders["destination"].transform([[destination]])[0][0],
+            "month": month,
+            "scheduled_dep_hour": scheduled_dep // 100,
+            "distance": distance,
+        }
+        ordered = [computed[col] for col in artifact["feature_columns"]]
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error construyendo features del modelo de retrasos: %s", exc)
+        return None
+
+    return np.array([ordered], dtype=float)
+
+
+def _derive_delay_prediction_ml(flight_context: dict, artifact: dict) -> Optional[DelayPrediction]:
+    """
+    Infiere `delay_prediction` con el modelo entrenado: un
+    RandomForestRegressor multi-salida (dep+arr delay) y un
+    RandomForestClassifier (main_cause). `is_disruption` no tiene
+    modelo propio -se deriva del mismo umbral que ya usaba el
+    heurístico-. `confidence` expresa la incertidumbre real del
+    regresor: dispersión entre las predicciones de sus árboles
+    individuales, normalizada contra la referencia calculada en
+    entrenamiento (`metrics.arr_delay_dispersion_reference`).
+
+    Devuelve None si no se pueden construir las features o falla la
+    inferencia -el llamador cae entonces al heurístico SQL-.
+    """
+    features = _build_model_features(flight_context, artifact)
+    if features is None:
+        return None
+
+    regressor = artifact["regressor"]
+    classifier = artifact["classifier"]
+
+    try:
+        dep_arr_pred = regressor.predict(features)[0]
+        cause_pred = classifier.predict(features)[0]
+        tree_preds = np.stack([tree.predict(features) for tree in regressor.estimators_])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Error en inferencia del modelo de retrasos: %s", exc)
+        return None
+
+    expected_dep_delay_min = max(0.0, float(dep_arr_pred[0]))
+    expected_arr_delay_min = max(0.0, float(dep_arr_pred[1]))
+
+    # tree.predict(features) devuelve forma (1, 2) -1 muestra, 2 salidas-;
+    # al apilar N árboles el resultado es (N, 1, 2), no (N, 2).
+    arr_delay_std = float(tree_preds[:, 0, 1].std())
+    reference = artifact.get("metrics", {}).get("arr_delay_dispersion_reference") or 1.0
+    confidence = round(max(0.0, min(0.95, 1.0 / (1.0 + arr_delay_std / reference))), 2)
+
+    return DelayPrediction(
+        expected_dep_delay_min=expected_dep_delay_min,
+        expected_arr_delay_min=expected_arr_delay_min,
+        is_disruption=expected_arr_delay_min > Settings.DELAY_THRESHOLD_MINUTES,
+        confidence=confidence,
+        main_cause=str(cause_pred),
+    )
+
+
+def _derive_delay_prediction(
+    analytics_result: AnalyticsResult, flight_context: Optional[dict]
+) -> Optional[DelayPrediction]:
+    """
+    Deriva `delay_prediction`. Intenta primero el modelo entrenado
+    (`_derive_delay_prediction_ml`); si el artefacto no está disponible,
+    no carga, o `flight_context` no trae datos suficientes para
+    construir sus features, cae al heurístico SQL determinista
+    (`_derive_delay_prediction_heuristic`) -mismo patrón de modo
+    degradado que el resto del proyecto, nunca deja al operador sin
+    predicción-.
+
+    Devuelve None si no se consultaron estadísticas de un vuelo
+    concreto (ninguno de los dos caminos aplica).
+    """
+    stats = analytics_result.get("flight_historical_stats")
+    if not stats:
+        return None
+
+    if flight_context:
+        artifact = _load_delay_model()
+        if artifact is not None:
+            prediction = _derive_delay_prediction_ml(flight_context, artifact)
+            if prediction is not None:
+                logger.info("delay_prediction calculada con el modelo ML.")
+                return prediction
+            logger.warning(
+                "No se pudo calcular delay_prediction con el modelo ML "
+                "(features incompletas o fallo de inferencia); se usa el heurístico SQL."
+            )
+
+    logger.info("delay_prediction calculada con el heurístico SQL (fallback).")
+    return _derive_delay_prediction_heuristic(analytics_result)
 
 
 # ---------------------------------------------------------------------------
@@ -381,7 +601,7 @@ def analytical_agent(state: SGIDAState) -> dict:
         analytics_result = _assemble_analytics_result(tool_results)
         flight_context = state.get("flight_context") or _derive_flight_context(tool_results)
         _ensure_cascade_risk_context(analytics_result, flight_context)
-        delay_prediction = _derive_delay_prediction(analytics_result)
+        delay_prediction = _derive_delay_prediction(analytics_result, flight_context)
 
     except Exception as exc:  # noqa: BLE001
         logger.error("analytical_agent fallo: %s", exc, exc_info=Settings.DEBUG_MODE)
