@@ -21,3 +21,5 @@ __pycache__/
 frontend/node_modules/*
 
 CLAUDE.md
+
+docs/memoria/*

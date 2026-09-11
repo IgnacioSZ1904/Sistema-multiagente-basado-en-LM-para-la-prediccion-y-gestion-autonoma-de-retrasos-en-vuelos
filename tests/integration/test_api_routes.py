@@ -17,7 +17,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.api.app import app
-from backend.app.services import history_service
+from backend.app.services import history_service, routes_service
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +103,22 @@ class TestDashboardRoute:
         assert data["recent_activity"] == []
         assert data["metrics"]["total_queries"] == 0
         assert data["notifications"] == []
+
+
+class TestRoutesRoute:
+    def test_routes_returns_origins_and_routes_shape(self, client, monkeypatch):
+        monkeypatch.setattr(
+            routes_service,
+            "_cache",
+            {"origins": ["Atlanta, GA"], "routes": {"Atlanta, GA": ["Chicago, IL"]}},
+        )
+
+        response = client.get("/api/routes")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["origins"] == ["Atlanta, GA"]
+        assert data["routes"]["Atlanta, GA"] == ["Chicago, IL"]
 
 
 class TestNotificationsRoute:

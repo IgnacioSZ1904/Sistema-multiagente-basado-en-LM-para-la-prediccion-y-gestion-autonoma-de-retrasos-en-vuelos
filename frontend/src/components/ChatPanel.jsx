@@ -29,14 +29,16 @@ export function ChatPanel() {
     setLoading(true)
     setError('')
 
-    const userMessage = { id: nextMessageId(), role: 'user', content: form.query }
+    const submittedForm = form
+    const userMessage = { id: nextMessageId(), role: 'user', content: submittedForm.query }
     setMessages((prev) => [...prev, userMessage])
+    setForm((prev) => ({ ...prev, query: '' }))
 
     try {
       const response = await fetch(`${API_BASE_URL}/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(form),
+        body: JSON.stringify(submittedForm),
       })
 
       if (!response.ok) {
@@ -103,68 +105,66 @@ export function ChatPanel() {
   }
 
   return (
-    <section className="grid">
-      <div className="card chat-panel">
-        <h2>Conversación</h2>
-        <div className="chat-history">
-          {messages.length === 0 ? (
-            <p className="chat-empty">Escribe una consulta para empezar.</p>
-          ) : (
-            messages.map((message) => (
-              <div key={message.id} className={`chat-bubble chat-bubble--${message.role}`}>
-                <p>{message.content}</p>
-                {message.draftNotifications?.length > 0 && (
-                  <div className="notification-drafts">
-                    {message.draftNotifications.map((draft) => (
-                      <div key={draft.localId} className="notification-draft">
-                        <span className="notification-draft__recipient">
-                          {draft.recipient_type === 'passenger' ? 'Borrador para pasajero' : 'Borrador para operador'}
-                        </span>
-                        <p>{draft.message}</p>
-                        <button
-                          type="button"
-                          disabled={draft.status === 'sent' || sendingNotificationId === draft.localId}
-                          onClick={() => handleSendNotification(message.id, draft)}
-                        >
-                          {draft.status === 'sent' ? 'Enviada' : 'Enviar'}
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))
-          )}
-        </div>
-
-        <form onSubmit={handleSubmit}>
-          <label htmlFor="query">Prompt</label>
-          <textarea
-            id="query"
-            rows="4"
-            value={form.query}
-            onChange={(event) => setForm({ ...form, query: event.target.value })}
-          />
-
-          <label htmlFor="optimization_criterion">Criterio de optimización</label>
-          <select
-            id="optimization_criterion"
-            value={form.optimization_criterion}
-            onChange={(event) => setForm({ ...form, optimization_criterion: event.target.value })}
-          >
-            {OPTIMIZATION_CRITERIA.map((criterion) => (
-              <option key={criterion.value} value={criterion.value}>
-                {criterion.label}
-              </option>
-            ))}
-          </select>
-
-          <button type="submit" disabled={loading}>
-            {loading ? 'Procesando...' : 'Ejecutar consulta'}
-          </button>
-          {error ? <p className="error">{error}</p> : null}
-        </form>
+    <div className="card chat-panel">
+      <h2>Conversación</h2>
+      <div className="chat-history">
+        {messages.length === 0 ? (
+          <p className="chat-empty">Escribe una consulta para empezar.</p>
+        ) : (
+          messages.map((message) => (
+            <div key={message.id} className={`chat-bubble chat-bubble--${message.role}`}>
+              <p>{message.content}</p>
+              {message.draftNotifications?.length > 0 && (
+                <div className="notification-drafts">
+                  {message.draftNotifications.map((draft) => (
+                    <div key={draft.localId} className="notification-draft">
+                      <span className="notification-draft__recipient">
+                        {draft.recipient_type === 'passenger' ? 'Borrador para pasajero' : 'Borrador para operador'}
+                      </span>
+                      <p>{draft.message}</p>
+                      <button
+                        type="button"
+                        disabled={draft.status === 'sent' || sendingNotificationId === draft.localId}
+                        onClick={() => handleSendNotification(message.id, draft)}
+                      >
+                        {draft.status === 'sent' ? 'Enviada' : 'Enviar'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))
+        )}
       </div>
-    </section>
+
+      <form onSubmit={handleSubmit}>
+        <label htmlFor="query">Prompt</label>
+        <textarea
+          id="query"
+          rows="1"
+          value={form.query}
+          onChange={(event) => setForm({ ...form, query: event.target.value })}
+        />
+
+        <label htmlFor="optimization_criterion">Criterio de optimización</label>
+        <select
+          id="optimization_criterion"
+          value={form.optimization_criterion}
+          onChange={(event) => setForm({ ...form, optimization_criterion: event.target.value })}
+        >
+          {OPTIMIZATION_CRITERIA.map((criterion) => (
+            <option key={criterion.value} value={criterion.value}>
+              {criterion.label}
+            </option>
+          ))}
+        </select>
+
+        <button type="submit" disabled={loading}>
+          {loading ? 'Procesando...' : 'Ejecutar consulta'}
+        </button>
+        {error ? <p className="error">{error}</p> : null}
+      </form>
+    </div>
   )
 }

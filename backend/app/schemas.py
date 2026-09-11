@@ -43,3 +43,8 @@ class DashboardResponse(BaseModel):
     recent_activity: list[dict[str, Any]]
     metrics: dict[str, Any]
     notifications: list[dict[str, Any]]
+
+
+class RoutesResponse(BaseModel):
+    origins: list[str]
+    routes: dict[str, list[str]]
